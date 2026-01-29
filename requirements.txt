@@ -2,4 +2,4 @@ fastapi
 uvicorn
 python-multipart
 pillow
-openai
+openai>=1.0.0

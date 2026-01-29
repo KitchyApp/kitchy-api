@@ -9,7 +9,7 @@ import json
 import base64
 
 # Lê API key da variável de ambiente
-client = OpenAI()
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 app = FastAPI(title="Smart Kitchen API")
 
@@ -45,8 +45,10 @@ def detect_ingredients_from_image(image_bytes: bytes, language: str = "pt") -> L
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.6,
         )
 
         content = response.choices[0].message.content.strip()
