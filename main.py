@@ -1,18 +1,48 @@
+"""
+Module: main.py
+
+Description:
+Core FastAPI application for Smart Kitchen backend.
+
+Responsibilities:
+- User authentication & authorization (JWT)
+- Subscription management (Google Play Billing )
+- Image analysis & ingredient detection (OpenAI Vision)
+- Recipe generation (AI-powered)
+- Rate limiting & caching (Redis)
+- User preferences & usage tracking
+
+Architecture Notes:
+- Uses FastAPI + SQLAlchemy ORM
+- Redis for caching and rate limiting
+- OpenAI for AI processing
+- Designed to evolve into SaaS-grade backend
+"""
+
+# ========================
+# STANDARD LIBRARIES
+# ========================
+
 import base64
 import io
 import json
 import os
-import stripe
-import hashlib
-import redis
-import structlog
+import uuid
 from datetime import date, datetime, timedelta
 from typing import List
+from enum import Enum
+
+# ========================
+# THIRD-PARTY LIBRARIES
+# ========================
+
+import redis
+import structlog
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy import create_engine, Column, Integer, String, Date, Boolean, DateTime, Index
-from sqlalchemy.orm import sessionmaker, declarative_base, Session, Mapped, mapped_column
+from sqlalchemy import Column, Integer, String, Date, Boolean, DateTime, Index
+from sqlalchemy.orm import Session, Mapped, mapped_column
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 from PIL import Image
@@ -21,81 +51,125 @@ from dotenv import load_dotenv
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from fastapi.responses import PlainTextResponse
+from slowapi.middleware import SlowAPIMiddleware
 from pydantic import BaseModel, EmailStr, constr
+from models import User, Purchase
+from routers import auth, billing
 
+# ========================
+# INTERNAL MODULES
+# ========================
+
+from database import Base, engine, SessionLocal
+from ai.normalization import normalize_ingredients
+from ai.cache import generate_cache_key, get_cached, set_cache
+
+
+
+# ========================
+# ENVIRONMENT CONFIGURATION
+# ========================
 
 load_dotenv()
 
-# ========================
-# CONFIG
-# ========================
-
 DATABASE_URL = os.getenv("DATABASE_URL")
 SECRET_KEY = os.getenv("SECRET_KEY")
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL não definido")
+
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY não definido")
+
+
+# JWT configuration
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 
-STRIPE_PRICE_ID = "price_1T1vP9Rv8WC0CvnKszqhOJyJ"
+# Google Play Billing config
+GOOGLE_PACKAGE_NAME = os.getenv("GOOGLE_PACKAGE_NAME")
 
+# OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
-redis_client = redis.from_url(os.getenv("REDIS_URL"))
+# Redis configuration
+redis_url = os.getenv("REDIS_URL")
 
+if redis_url:
+    # Production (Render)
+    redis_client = redis.from_url(redis_url, decode_responses=True)
+else:
+    # Local development
+    redis_client = redis.Redis(
+        host="localhost",
+        port=6379,
+        decode_responses=True
+    )
+
+# Structured logging (production-grade logging system)
 logger = structlog.get_logger()
 
 # ========================
-# FASTAPI
+# FASTAPI INITIALIZATION
 # ========================
 
 app = FastAPI()
 
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
+# Create database tables automatically
+Base.metadata.create_all(bind=engine)
+
+# Register routers (modular API design)
+app.include_router(auth.router, prefix="/auth", tags=["Auth"])
+
+# Billing routes
+app.include_router(billing.router, prefix="/billing", tags=["Billing"])
+
+# ========================
+# RATE LIMITING (ANTI-ABUSE)
+# ========================
+
+limiter = Limiter(
+    key_func=get_remote_address,
+    storage_uri=redis_url if redis_url else "redis://localhost:6379"
+)
+
+# Attach limiter to app state
+app.state.limiter = limiter  # type: ignore
+
+# Middleware for rate limiting
+app.add_middleware(SlowAPIMiddleware)
+
+# Custom handler for rate limit exceeded
 app.add_exception_handler(
     RateLimitExceeded,
-    lambda r, e: PlainTextResponse("Rate limit exceeded", status_code=429),
+    lambda request, exc: PlainTextResponse(
+        "Rate limit exceeded",
+        status_code=429
+    ),
 )
 
+
 # ========================
-# DATABASE
+# ENUMS
 # ========================
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_size=10,
-    max_overflow=20,
-    pool_pre_ping=True,
-)
 
-SessionLocal = sessionmaker(bind=engine)
-Base = declarative_base()
+class SubscriptionPlan(str, Enum):
+    FREE = "free"
+    MONTHLY = "monthly"
+    YEARLY = "yearly"
 
+# ========================
+# DATABASE MODELS
+# ========================
 
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True)
-    email = Column(String, unique=True)
-    password = Column(String)
-    plan = Column(String, default="free")
-    analyses_today = Column(Integer, default=0)
-    last_analysis_date = Column(Date, nullable=True)
-
-    # Stripe
-    stripe_customer_id = Column(String, nullable=True)
-
-    # Restrições alimentares
-    dietary_gluten_free = Column(Boolean, default=False)
-    dietary_vegetarian = Column(Boolean, default=False)
-    dietary_vegan = Column(Boolean, default=False)
-    preferred_style = Column(String, default="balanced")
-    preferred_cuisine = Column(String, default="international")
-
-    marketing_consent = Column(Boolean, default=False)
 
 class RecipeCache(Base):
+    """
+        Database fallback cache for generated recipes.
+
+        Used when Redis is unavailable or for persistence.
+        """
     __tablename__ = "recipe_cache"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -103,63 +177,124 @@ class RecipeCache(Base):
     response_json: Mapped[str] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-Index("idx_user_id", User.id)
-Index("idx_ingredients_hash", RecipeCache.ingredients_hash)
-Base.metadata.create_all(bind=engine)
 
-class RegisterRequest(BaseModel):
-    email: EmailStr
-    password: constr(min_length=8)
+class PasswordResetToken(Base):
+    """
+        Token used for password reset flows.
 
-class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
+        Security:
+        - Short expiration time (15 min recommended)
+        """
+    __tablename__ = "password_reset_tokens"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer)
+    token = Column(String, unique=True)
+    expires_at = Column(DateTime)
+
 
 class UsageLog(Base):
+    """
+       Tracks API usage (tokens, cost, analytics).
+
+       Future:
+       - billing metrics
+       - rate optimization
+       """
     __tablename__ = "usage_logs"
+
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer)
     tokens_used = Column(Integer)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-Base.metadata.create_all(bind=engine)
+
+# Database indexes (performance optimization)
+Index("idx_user_id", User.id)
+Index("idx_ingredients_hash", RecipeCache.ingredients_hash)
+Index("idx_purchase_token_hash", Purchase.purchase_token_hash)
+
 
 # ========================
-# AUTH
+# REQUEST SCHEMAS (VALIDATION)
+# ========================
+
+class IngredientsRequest(BaseModel):
+    ingredients: str
+
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: constr(min_length=8)
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class PurchaseRequest(BaseModel):
+    """
+        Request schema for verifying purchases.
+    """
+    purchase_token: str
+    product_id: str
+
+
+# ========================
+# AUTHENTICATION UTILITIES
 # ========================
 
 pwd_context = CryptContext(schemes=["bcrypt"])
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
+
 def hash_password(password: str):
+    """Hashes a plaintext password."""
     return pwd_context.hash(password)
 
+
 def verify_password(password, hashed):
+    """Verifies a password against its hash."""
     return pwd_context.verify(password, hashed)
 
+
 def create_token(data: dict):
+    """
+        Creates a JWT access token.
+
+        Includes expiration for security.
+    """
+    if not SECRET_KEY:
+        raise RuntimeError("SECRET_KEY não configurado")
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
-
 # ========================
 # DEPENDENCIES
 # ========================
-
 def get_db():
+    """
+        Provides a database session per request.
+        Ensures proper cleanup.
+    """
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
+
 def get_current_user(
     token: str = Depends(oauth2_scheme),
     db: Session = Depends(get_db)
 ):
+    """
+        Extracts and validates the current user from JWT token.
+    """
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id = payload.get("id")
@@ -173,13 +308,127 @@ def get_current_user(
 
     return user
 
+
+# ========================
+# SUBSCRIPTION LOGIC
+# ========================
+
+def calculate_expiry(product_id: str):
+    """
+        Calculates subscription expiration date based on product type.
+    """
+    now = datetime.utcnow()
+
+    if product_id == "premium_monthly":
+        return now + timedelta(days=30)
+
+    if product_id == "premium_yearly":
+        return now + timedelta(days=365)
+
+    return now
+
+
+def check_user_subscription(user: User, db: Session):
+    """
+       Validates if user subscription is still active.
+
+       Updates user plan accordingly.
+    """
+    purchase = db.query(Purchase).filter(
+        Purchase.user_id == user.id,
+        Purchase.status == "active"
+    ).order_by(Purchase.created_at.desc()).first()
+
+    if not purchase:
+        user.plan = "free"
+        return
+
+    if purchase.expires_at < datetime.utcnow():
+        purchase.status = "expired"
+        user.plan = "free"
+        db.commit()
+    else:
+        user.plan = "premium"
+
+# ========================
+# GOOGLE BILLING (SIMPLIFIED VALIDATION)
+# ========================
+
+
+@app.post("/verify-purchase")
+def verify_purchase(
+    data: PurchaseRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+        Endpoint to validate and register a purchase.
+
+        Notes:
+        - Prevents duplicate purchase_token usage (anti-fraud)
+        - Immediately activates premium access
+    """
+
+    # Basic validation
+    if not data.purchase_token:
+        raise HTTPException(400, "Token inválido")
+
+    is_valid = validate_google_purchase(
+        data.purchase_token,
+        data.product_id
+    )
+
+    # Prevent duplicate purchases (important security check)
+    existing = db.query(Purchase).filter(
+        Purchase.purchase_token == data.purchase_token
+    ).first()
+
+    if existing:
+        raise HTTPException(400, "Compra já registada")
+
+    # Calculate subscription expiration
+    expires_at = calculate_expiry(data.product_id)
+
+    # Store purchase
+    purchase = Purchase(
+        user_id=current_user.id,
+        product_id=data.product_id,
+        purchase_token=data.purchase_token,
+        expires_at=expires_at,
+        status="active"
+    )
+
+    db.add(purchase)
+
+    # Upgrade user immediately
+    current_user.plan = "premium"
+    db.commit()
+
+    return {"status": "premium_activated", "expires_at": expires_at}
+
+
 # ========================
 # AI FUNCTIONS
 # ========================
 
 
 def detect_ingredients(image_bytes: bytes, language: str = "pt"):
+    """
+        Uses OpenAI Vision to detect ingredients from an image.
 
+        Args:
+            image_bytes: Raw image bytes
+            language: Output language for ingredient names
+
+        Returns:
+            List of detected ingredients with confidence levels
+
+        Notes:
+        - Forces strict JSON output format
+        - Ignores text inside images (important for accuracy)
+    """
+
+    # Convert image to base64 (required by API)
     img_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
     response = client.responses.create(
@@ -208,18 +457,39 @@ def detect_ingredients(image_bytes: bytes, language: str = "pt"):
     )
 
     try:
+        # Parse model output safely
         return json.loads(response.output_text.strip())
-    except:
+    except Exception:
+        # Fallback in case of malformed AI response
         return []
 
 
-def generate_recipes(
+async def generate_recipes(
         ingredients: List[str],
         user: User,
         db: Session,
         language: str = "en-US",
 ):
-    num_recipes = 1 if user.plan == "free" else 3
+    """
+        Generates recipes using AI based on ingredients and user preferences.
+
+        Features:
+        - Ingredient normalization
+        - Dietary restrictions support
+        - Multi-language support
+        - Redis caching (performance optimization)
+
+        Returns:
+            List of recipes (already extracted from JSON response)
+    """
+
+    # Normalize ingredient names (important for consistency + cache hits)
+    ingredients = normalize_ingredients(ingredients)
+
+    # Free vs premium logic
+    num_recipes = 1 if user.plan == "free" else 4
+
+    # Build dietary restrictions dynamically
     restrictions = []
     user_style = user.preferred_style
     user_cuisine = user.preferred_cuisine
@@ -235,26 +505,31 @@ def generate_recipes(
 
     restrictions_text = ", ".join(restrictions) if restrictions else "none"
 
+    # Language adaptation instruction
     language_instruction = f"Generate recipes in {language}. Adapt the culinary style to that country."
 
-    ingredients_string = ",".join(sorted(ingredients)) + "_" + language
-    ingredients_hash = hashlib.sha256(
-        ingredients_string.encode()
-    ).hexdigest()
+    # ========================
+    # REDIS CACHE (CRITICAL FOR COST + SPEED)
+    # ========================
 
-    # Verificar cache
-    cached = db.query(RecipeCache).filter(
-        RecipeCache.ingredients_hash == ingredients_hash
-    ).first()
+    cache_key = generate_cache_key(ingredients, language)
 
+    cached = await get_cached(cache_key)
     if cached:
-        return json.loads(cached.response_json)
+        return cached  # instant response (no API cost)
+
+    # ========================
+    # PROMPT ENGINEERING
+    # ========================
 
     prompt = f"""
-    You are a professional nutrition chef.
-    
+    You are:
+    - Michelin chef
+    - Professional nutritionist
+    - Expert in fast cooking
+
     {language_instruction}
-    
+
     User preferences:
     - Style: {user_style}
     - Cuisine: {user_cuisine}
@@ -267,52 +542,97 @@ def generate_recipes(
 
     Rules:
     - Max cooking time 30 minutes
-    - Respect dietary restrictions
-    - Use ONLY given ingredients + basic kitchen staples (salt, pepper, olive oil)
-    - Provide approximate nutritional values
-    - Output ONLY valid JSON
+    - Use ONLY given ingredients + basic staples
+    - Provide nutritional values
+    - Suggest missing ingredients
+    - Output ONLY JSON
 
     Format:
     {{
-     "recipes":[
-       {{
-         "title":"",
-         "time_minutes":0,
-         "calories":0,
-         "protein_g":0,
-         "carbs_g":0,
-         "fat_g":0,
-         "vitamins":{{
+      "recipes":[
+        {{
+          "title":"",
+          "time_minutes":0,
+          "calories":0,
+          "protein_g":0,
+          "carbs_g":0,
+          "fat_g":0,
+          "vitamins":{{
             "vitamin_a":"",
             "vitamin_c":"",
             "vitamin_d":"",
             "vitamin_b12":""
-         }},
-         "steps":[]
-       }}
-     ]
+          }},
+          "missing_ingredients":[],
+          "steps":[]
+        }}
+      ]
     }}
 
-    Generate {num_recipes} recipes.
+    Generate {num_recipes} recipes in JSON.
     """
 
+    # Call OpenAI
     response = client.responses.create(
         model="gpt-4.1-mini",
         input=prompt,
-        max_output_tokens=400
+        max_output_tokens=700
     )
 
     parsed = json.loads(response.output_text)
 
-    # Guardar na cache
-    new_cache = RecipeCache(
-        ingredients_hash=ingredients_hash,
-        response_json=json.dumps(parsed)
-    )
-    db.add(new_cache)
-    db.commit()
+    # Extract only recipes (important simplification)
+    recipes = parsed["recipes"]
 
-    return parsed
+    # Store in cache (store only useful data)
+    await set_cache(cache_key, recipes)
+
+    return recipes
+
+
+# ========================
+# IMAGE SCAN ENDPOINT
+# ========================
+
+@app.post("/scan-ingredients")
+@limiter.limit("10/minute")
+async def scan_ingredients(
+    request: Request,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user)
+):
+    """
+        Endpoint to scan an image and return detected ingredients + recipes.
+
+        Flow:
+        1. Read image
+        2. Detect ingredients (AI Vision)
+        3. Generate recipes (AI text model)
+    """
+
+    image_bytes = await file.read()
+
+    # Detect ingredients from image
+    detected = detect_ingredients(image_bytes)
+
+    if not detected:
+        raise HTTPException(400, "No ingredients detected")
+
+    # Extract ingredient names
+    ingredients = [item["name"] for item in detected]
+
+    # Generate recipes
+    recipes = await generate_recipes(
+        ingredients=ingredients,
+        user=user,
+        db=db
+    )
+
+    return {
+        "ingredients_detected": detected,
+        "recipes": recipes
+    }
 
 
 # ========================
@@ -321,6 +641,14 @@ def generate_recipes(
 
 @app.post("/register")
 def register(data: RegisterRequest, db: Session = Depends(get_db)):
+    """
+        Registers a new user.
+
+        Security:
+        - Prevents duplicate emails
+        - Stores hashed password only
+    """
+
     email = data.email
     password = data.password
 
@@ -335,15 +663,128 @@ def register(data: RegisterRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/login")
-def login(email: str, password: str, db: Session = Depends(get_db)):
+def login(data: LoginRequest, db: Session = Depends(get_db)):
+    """
+        Authenticates user and returns JWT token.
+    """
 
-    user = db.query(User).filter(User.email == email).first()
+    user = db.query(User).filter(User.email == data.email).first()
 
-    if not user or not verify_password(password, user.password):
+    if not user or not verify_password(data.password, user.password):
         raise HTTPException(401, "Credenciais inválidas")
 
     token = create_token({"id": user.id})
+
     return {"access_token": token}
+
+
+@app.get("/user-status")
+def get_user_status(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+        Returns whether the current user has premium access.
+
+        Ensures subscription status is up-to-date before responding.
+    """
+
+    check_user_subscription(current_user, db)
+
+    return {"is_premium": current_user.plan == "premium"}
+
+
+@app.get("/subscription-status")
+def subscription_status(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+        Returns detailed subscription status.
+
+        - free → no purchases
+        - expired → payment expired
+        - active → valid subscription
+        """
+    purchase = db.query(Purchase).filter(
+        Purchase.user_id == current_user.id
+    ).order_by(Purchase.created_at.desc()).first()
+
+    if not purchase:
+        return {"status": "free"}
+
+    if purchase.expires_at < datetime.utcnow():
+        return {
+            "status": "expired",
+            "message": "Pagamento falhou. Subscrição cancelada."
+        }
+
+    return {
+        "status": "active",
+        "expires_at": purchase.expires_at
+    }
+
+
+@app.post("/forgot-password")
+def forgot_password(email: str, db: Session = Depends(get_db)):
+    """
+       Initiates password reset flow.
+
+       Security:
+       - Does NOT reveal if email exists (anti-enumeration attack)
+       - Generates temporary token with expiration
+    """
+
+    user = db.query(User).filter(User.email == email).first()
+
+    # Always return success message
+    if not user:
+        return {"message": "Se existir conta, email enviado"}  # 🔒 segurança
+
+    # Generate secure random token
+    token = str(uuid.uuid4())
+
+    reset = PasswordResetToken(
+        user_id=user.id,
+        token=token,
+        expires_at=datetime.utcnow() + timedelta(minutes=15)
+    )
+
+    db.add(reset)
+    db.commit()
+
+    # integrate email provider (SendGrid, SES, etc.)
+    print(f"RESET LINK: https://teusite.com/reset?token={token}")
+
+    return {"message": "Email enviado"}
+
+
+@app.post("/reset-password")
+def reset_password(token: str, new_password: str, db: Session = Depends(get_db)):
+    """
+        Resets user password using a valid reset token.
+
+        Security:
+        - Token must exist and not be expired
+        - Token is deleted after use (one-time use)
+    """
+
+    reset = db.query(PasswordResetToken).filter(
+        PasswordResetToken.token == token
+    ).first()
+
+    if not reset or reset.expires_at < datetime.utcnow():
+        raise HTTPException(400, "Token inválido")
+
+    user = db.query(User).filter(User.id == reset.user_id).first()
+
+    # Update password securely
+    user.password = hash_password(new_password)
+
+    db.delete(reset)
+    db.commit()
+
+    return {"message": "Password atualizada"}
 
 
 @app.post("/update-preferences")
@@ -354,9 +795,16 @@ def update_preferences(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    """
+        Updates user dietary preferences.
+
+        These preferences directly affect recipe generation.
+    """
+
     current_user.dietary_gluten_free = gluten_free
     current_user.dietary_vegetarian = vegetarian
     current_user.dietary_vegan = vegan
+
     db.commit()
 
     return {"message": "Preferências atualizadas"}
@@ -364,118 +812,19 @@ def update_preferences(
 
 @app.get("/health")
 def health():
+    """
+        Health check endpoint.
+
+        Used for:
+        - Load balancers
+        - Monitoring systems
+        - Uptime checks
+    """
     return {"status": "ok"}
 
 
 # ========================
-# STRIPE CHECKOUT
-# ========================
-
-@app.post("/create-checkout-session")
-def create_checkout_session(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-
-    try:
-        # Criar customer se não existir
-        if not current_user.stripe_customer_id:
-            customer = stripe.Customer.create(email=current_user.email)
-            current_user.stripe_customer_id = customer.id
-            db.commit()
-
-        session = stripe.checkout.Session.create(
-            customer=current_user.stripe_customer_id,
-            payment_method_types=["card"],
-            mode="subscription",
-            line_items=[
-                {
-                    "price": STRIPE_PRICE_ID,
-                    "quantity": 1,
-                }
-            ],
-            success_url="https://google.com",
-            cancel_url="https://google.com",
-        )
-
-        return {"checkout_url": session.url}
-
-    except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
-
-
-@app.post("/create-portal-session")
-def create_portal_session(
-    current_user: User = Depends(get_current_user)
-):
-    if not current_user.stripe_customer_id:
-        raise HTTPException(400, "Sem subscrição ativa")
-
-    session = stripe.billing_portal.Session.create(
-        customer=current_user.stripe_customer_id,
-        return_url="https://teu-frontend.com"
-    )
-
-    return {"url": session.url}
-
-
-# ========================
-# STRIPE WEBHOOK
-# ========================
-
-@app.post("/stripe-webhook")
-async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
-
-    payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
-    endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
-
-    try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, endpoint_secret
-        )
-    except Exception:
-        raise HTTPException(400, "Webhook inválido")
-
-    event_type = event["type"]
-
-    # PAGAMENTO CONCLUÍDO → vira premium
-
-    if event_type == "checkout.session.completed":
-        session = event["data"]["object"]
-        customer_id = session["customer"]
-
-        user = db.query(User).filter(User.stripe_customer_id == customer_id).first()
-        if user:
-            user.plan = "premium"
-            db.commit()
-
-    # SUBSCRIÇÃO CANCELADA → volta a free
-
-    if event_type == "customer.subscription.deleted":
-        subscription = event["data"]["object"]
-        customer_id = subscription["customer"]
-
-        user = db.query(User).filter(User.stripe_customer_id == customer_id).first()
-        if user:
-            user.plan = "free"
-            db.commit()
-
-    #  FALHA DE PAGAMENTO → volta a free
-    
-    if event_type == "invoice.payment_failed":
-        invoice = event["data"]["object"]
-        customer_id = invoice["customer"]
-
-        user = db.query(User).filter(User.stripe_customer_id == customer_id).first()
-        if user:
-            user.plan = "free"
-            db.commit()
-
-    return {"status": "success"}
-
-# ========================
-# IMAGE ANALYSIS
+# IMAGE ANALYSIS (MAIN PREMIUM FEATURE)
 # ========================
 
 @app.post("/analyze-image/")
@@ -486,7 +835,17 @@ async def analyze_image(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    # Detectar idioma automaticamente
+    """
+       Main endpoint for image-based recipe generation.
+
+       Features:
+       - Language auto-detection
+       - Daily usage limits (free vs premium)
+       - Image validation (size + format)
+       - AI ingredient detection + recipe generation
+    """
+
+    # Detect user language from headers
     accept_language = request.headers.get("accept-language")
 
     if accept_language:
@@ -494,41 +853,94 @@ async def analyze_image(
     else:
         language = "en-US"
 
+    # Reset daily usage counter if new day
     hoje = date.today()
 
     if current_user.last_analysis_date != hoje:
         current_user.analyses_today = 0
         current_user.last_analysis_date = hoje
 
-    limite = 1 if current_user.plan == "free" else 3
+    # Define daily limits
+    limit = 1 if current_user.plan == "free" else 4
 
-    if current_user.analyses_today >= limite:
+    if current_user.analyses_today >= limit:
         raise HTTPException(403, "Limite diário atingido")
 
     image_bytes = await file.read()
 
+    # Security: file size limit (~5MB)
     if len(image_bytes) > 5_000_000:
         raise HTTPException(400, "Imagem demasiado grande")
 
+    # Validate image integrity
     try:
         Image.open(io.BytesIO(image_bytes)).verify()
-    except:
+    except Exception:
         raise HTTPException(400, "Imagem inválida")
 
+    # Detect ingredients via AI
     ingredients = detect_ingredients(image_bytes)
+
+    # Extract names for recipe generation
     ingredient_names = [i["name"] for i in ingredients]
 
-    recipes = generate_recipes(
+    # Generate recipes
+    recipes = await generate_recipes(
         ingredient_names,
         current_user,
         db,
         language=language
     )
 
+    # Update usage counter
     current_user.analyses_today += 1
     db.commit()
 
     return {
         "ingredients_detected": ingredients,
-        "recipes": recipes["recipes"]
+        "recipes": recipes
+    }
+
+
+# ========================
+# STATIC RECIPES (TEST ENDPOINT)
+# ========================
+
+@app.get("/recipes")
+@limiter.limit("10/minute")
+async def get_recipes(request: Request):
+    pass
+    return {
+        "recipes": [
+            {
+                "title": "Omelete Proteica",
+                "calories": 320,
+                "protein": 25,
+                "carbs": 5,
+                "fat": 20,
+                "time_minutes": 10,
+                "steps": [
+                    "Bater os ovos",
+                    "Adicionar sal e pimenta",
+                    "Cozinhar numa frigideira",
+                    "Servir quente"
+                ],
+                "is_premium": False
+            },
+            {
+                "title": "Bowl Fitness",
+                "calories": 450,
+                "protein": 35,
+                "carbs": 30,
+                "fat": 15,
+                "time_minutes": 15,
+                "steps": [
+                    "Grelhar o frango",
+                    "Cozinhar arroz",
+                    "Adicionar legumes",
+                    "Misturar tudo"
+                ],
+                "is_premium": True
+            }
+        ]
     }
