@@ -4,12 +4,15 @@ Authentication Service Layer
 This module centralizes authentication logic:
 - login
 - refresh token rotation
+- user status / subscription check
 - security enforcement
 
 Why:
 - keeps routers clean
 - improves scalability and maintainability
 """
+
+from datetime import datetime
 
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
@@ -19,6 +22,7 @@ from core.security import (
     verify_password,
     create_access_token,
     create_refresh_token,
+    hash_password,
     hash_token
 )
 
@@ -55,6 +59,66 @@ def login_user(db: Session, email: str, password: str):
     return {
         "access_token": access_token,
         "refresh_token": refresh_token
+    }
+
+
+def register_user(
+    db: Session,
+    email: str,
+    password: str
+):
+    """
+    Register new user.
+    """
+
+    existing = db.query(User).filter(
+        User.email == email
+    ).first()
+
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Email already exists"
+        )
+
+    user = User(
+        email=email,
+        password=hash_password(password)
+    )
+
+    db.add(user)
+    db.commit()
+
+    return {
+        "message": "User created"
+    }
+
+
+def get_user_status(user: User, db: Session) -> dict:
+    """
+    Return the real premium status for the authenticated user.
+
+    Logic (uses user.plan + user.plan_expiry stored at purchase time):
+    - plan == "free"     → not premium, no expiry to check
+    - plan == "premium"  → premium only if plan_expiry is None (manual/no-expiry)
+                           or plan_expiry is still in the future
+    - plan == "premium" but plan_expiry is in the past → auto-downgrade to free
+
+    This keeps the query cheap (no extra Purchase table JOIN on every request)
+    while still catching expired subscriptions automatically.
+    """
+    if user.plan == "premium" and user.plan_expiry is not None:
+        if user.plan_expiry < datetime.utcnow():
+            user.plan = "free"
+            user.plan_expiry = None
+            db.commit()
+
+    is_premium = user.plan == "premium"
+
+    return {
+        "is_premium": is_premium,
+        "plan": user.plan,
+        "plan_expiry": user.plan_expiry.isoformat() if user.plan_expiry else None,
     }
 
 

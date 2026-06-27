@@ -26,5 +26,10 @@ class LoginSchema(BaseModel):
     password: constr(min_length=8)  # minimum 8 characters
 
 
+class RegisterSchema(BaseModel):
+    email: EmailStr
+    password: constr(min_length=8)
+
+
 class RefreshSchema(BaseModel):
     refresh_token: str

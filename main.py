@@ -40,11 +40,8 @@ import redis
 import structlog
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
-from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy import Column, Integer, String, Date, Boolean, DateTime, Index
 from sqlalchemy.orm import Session, Mapped, mapped_column
-from jose import jwt, JWTError
-from passlib.context import CryptContext
 from PIL import Image
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -55,6 +52,8 @@ from slowapi.middleware import SlowAPIMiddleware
 from pydantic import BaseModel, EmailStr, constr
 from models import User, Purchase
 from routers import auth, billing
+from core.security import hash_password
+from dependencies.auth import get_current_user
 
 # ========================
 # INTERNAL MODULES
@@ -63,6 +62,7 @@ from routers import auth, billing
 from database import Base, engine, SessionLocal
 from ai.normalization import normalize_ingredients
 from ai.cache import generate_cache_key, get_cached, set_cache
+from routers import favorites
 
 
 
@@ -73,18 +73,9 @@ from ai.cache import generate_cache_key, get_cached, set_cache
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-SECRET_KEY = os.getenv("SECRET_KEY")
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL não definido")
-
-if not SECRET_KEY:
-    raise RuntimeError("SECRET_KEY não definido")
-
-
-# JWT configuration
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 
 # Google Play Billing config
 GOOGLE_PACKAGE_NAME = os.getenv("GOOGLE_PACKAGE_NAME")
@@ -120,6 +111,13 @@ Base.metadata.create_all(bind=engine)
 
 # Register routers (modular API design)
 app.include_router(auth.router, prefix="/auth", tags=["Auth"])
+
+app.include_router(
+    favorites.router,
+    prefix="/favorites",
+    tags=["Favorites"],
+)
+
 
 # Billing routes
 app.include_router(billing.router, prefix="/billing", tags=["Billing"])
@@ -242,71 +240,19 @@ class PurchaseRequest(BaseModel):
 
 
 # ========================
-# AUTHENTICATION UTILITIES
-# ========================
-
-pwd_context = CryptContext(schemes=["bcrypt"])
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-
-
-def hash_password(password: str):
-    """Hashes a plaintext password."""
-    return pwd_context.hash(password)
-
-
-def verify_password(password, hashed):
-    """Verifies a password against its hash."""
-    return pwd_context.verify(password, hashed)
-
-
-def create_token(data: dict):
-    """
-        Creates a JWT access token.
-
-        Includes expiration for security.
-    """
-    if not SECRET_KEY:
-        raise RuntimeError("SECRET_KEY não configurado")
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-
-# ========================
 # DEPENDENCIES
 # ========================
+
 def get_db():
     """
-        Provides a database session per request.
-        Ensures proper cleanup.
+    Provides a database session per request.
+    Ensures proper cleanup.
     """
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
-
-
-def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    db: Session = Depends(get_db)
-):
-    """
-        Extracts and validates the current user from JWT token.
-    """
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("id")
-    except JWTError:
-        raise HTTPException(401, "Token inválido")
-
-    user = db.query(User).filter(User.id == user_id).first()
-
-    if not user:
-        raise HTTPException(401, "Utilizador não encontrado")
-
-    return user
 
 
 # ========================
@@ -330,25 +276,30 @@ def calculate_expiry(product_id: str):
 
 def check_user_subscription(user: User, db: Session):
     """
-       Validates if user subscription is still active.
+    Validates the most recent purchase and syncs user.plan accordingly.
 
-       Updates user plan accordingly.
+    Uses Purchase.expiry_date (the real DB column).
+    Filters for the most recent purchase that has not yet expired.
     """
-    purchase = db.query(Purchase).filter(
-        Purchase.user_id == user.id,
-        Purchase.status == "active"
-    ).order_by(Purchase.created_at.desc()).first()
+    now = datetime.utcnow()
 
-    if not purchase:
-        user.plan = "free"
-        return
+    active_purchase = (
+        db.query(Purchase)
+        .filter(
+            Purchase.user_id == user.id,
+            Purchase.expiry_date > now,
+        )
+        .order_by(Purchase.created_at.desc())
+        .first()
+    )
 
-    if purchase.expires_at < datetime.utcnow():
-        purchase.status = "expired"
-        user.plan = "free"
-        db.commit()
-    else:
+    if active_purchase:
         user.plan = "premium"
+    else:
+        user.plan = "free"
+        user.plan_expiry = None
+
+    db.commit()
 
 # ========================
 # GOOGLE BILLING (SIMPLIFIED VALIDATION)
@@ -543,8 +494,13 @@ async def generate_recipes(
     Rules:
     - Max cooking time 30 minutes
     - Use ONLY given ingredients + basic staples
+    - ALL ingredients MUST be used in the recipe
+    - Mention ingredients explicitly in the cooking steps
+    - Steps must be detailed and realistic
+    - Recipes must feel like real cooking instructions
+    - Include preparation steps for ingredients
+    - Suggest optional extra ingredients to improve the recipe
     - Provide nutritional values
-    - Suggest missing ingredients
     - Output ONLY JSON
 
     Format:
@@ -557,13 +513,15 @@ async def generate_recipes(
           "protein_g":0,
           "carbs_g":0,
           "fat_g":0,
+          
           "vitamins":{{
             "vitamin_a":"",
             "vitamin_c":"",
             "vitamin_d":"",
             "vitamin_b12":""
           }},
-          "missing_ingredients":[],
+          "optional_ingredients":[],
+          
           "steps":[]
         }}
       ]
@@ -635,93 +593,38 @@ async def scan_ingredients(
     }
 
 
-# ========================
-# AUTH ROUTES
-# ========================
-
-@app.post("/register")
-def register(data: RegisterRequest, db: Session = Depends(get_db)):
-    """
-        Registers a new user.
-
-        Security:
-        - Prevents duplicate emails
-        - Stores hashed password only
-    """
-
-    email = data.email
-    password = data.password
-
-    if db.query(User).filter(User.email == email).first():
-        raise HTTPException(400, "Email já existe")
-
-    user = User(email=email, password=hash_password(password))
-    db.add(user)
-    db.commit()
-
-    return {"message": "criado"}
-
-
-@app.post("/login")
-def login(data: LoginRequest, db: Session = Depends(get_db)):
-    """
-        Authenticates user and returns JWT token.
-    """
-
-    user = db.query(User).filter(User.email == data.email).first()
-
-    if not user or not verify_password(data.password, user.password):
-        raise HTTPException(401, "Credenciais inválidas")
-
-    token = create_token({"id": user.id})
-
-    return {"access_token": token}
-
-
-@app.get("/user-status")
-def get_user_status(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-        Returns whether the current user has premium access.
-
-        Ensures subscription status is up-to-date before responding.
-    """
-
-    check_user_subscription(current_user, db)
-
-    return {"is_premium": current_user.plan == "premium"}
-
 
 @app.get("/subscription-status")
 def subscription_status(
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """
-        Returns detailed subscription status.
+    Returns detailed subscription status for the authenticated user.
 
-        - free → no purchases
-        - expired → payment expired
-        - active → valid subscription
-        """
-    purchase = db.query(Purchase).filter(
-        Purchase.user_id == current_user.id
-    ).order_by(Purchase.created_at.desc()).first()
+    - free    → no purchases on record
+    - expired → most recent purchase has passed its expiry_date
+    - active  → valid purchase with expiry_date in the future
+    """
+    purchase = (
+        db.query(Purchase)
+        .filter(Purchase.user_id == current_user.id)
+        .order_by(Purchase.created_at.desc())
+        .first()
+    )
 
     if not purchase:
         return {"status": "free"}
 
-    if purchase.expires_at < datetime.utcnow():
+    if purchase.expiry_date < datetime.utcnow():
         return {
             "status": "expired",
-            "message": "Pagamento falhou. Subscrição cancelada."
+            "message": "Subscrição expirada.",
         }
 
     return {
         "status": "active",
-        "expires_at": purchase.expires_at
+        "expiry_date": purchase.expiry_date.isoformat(),
     }
 
 

@@ -1,0 +1,22 @@
+# === CHAVES E CONFIGURAÇÕES SENSÍVEIS ===
+.env
+.env.*
+*.env
+config.py
+secrets.json
+*.pem
+*.key
+*.p12
+
+# === PASTAS PESADAS DO PYTHON ===
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# === CONFIGURAÇÕES IDE ===
+.idea/
+.vscode/
+*.iml
