@@ -41,57 +41,82 @@ def login_user(db: Session, email: str, password: str):
     - Password verified via bcrypt
     - Refresh token stored hashed (never raw)
     """
-
-    user = db.query(User).filter(User.email == email).first()
+    try:
+        user = db.query(User).filter(User.email == email).first()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database error during login: {exc}",
+        ) from exc
 
     if not user or not verify_password(password, user.password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     access_token = create_access_token({"user_id": user.id})
-
     refresh_token = create_refresh_token()
 
-    # Store hashed version only
-    user.refresh_token_hash = hash_token(refresh_token)
-
-    db.commit()
+    try:
+        user.refresh_token_hash = hash_token(refresh_token)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database error saving session: {exc}",
+        ) from exc
 
     return {
         "access_token": access_token,
-        "refresh_token": refresh_token
+        "refresh_token": refresh_token,
     }
 
 
-def register_user(
-    db: Session,
-    email: str,
-    password: str
-):
+def register_user(db: Session, email: str, password: str):
     """
-    Register new user.
-    """
+    Register a new user account.
 
-    existing = db.query(User).filter(
-        User.email == email
-    ).first()
+    Raises HTTP 400 if the email is already taken.
+    Raises HTTP 500 (with a descriptive JSON body) on any database error,
+    instead of letting an unhandled exception crash the uvicorn worker and
+    produce an opaque traceback.
+    """
+    # --- check for existing account ---
+    try:
+        existing = db.query(User).filter(User.email == email).first()
+    except Exception as exc:
+        # Most likely cause: schema mismatch (a column in the model doesn't
+        # exist in the physical table). run_column_migrations() in database.py
+        # normally fixes this on startup, but we guard here too.
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Database error while checking for existing user: {exc}. "
+                "The users table schema may be out of date — restart the server "
+                "to trigger the automatic column migration."
+            ),
+        ) from exc
 
     if existing:
-        raise HTTPException(
-            status_code=400,
-            detail="Email already exists"
+        raise HTTPException(status_code=400, detail="Email already exists")
+
+    # --- create new user ---
+    try:
+        user = User(
+            email=email,
+            password=hash_password(password),
         )
+        db.add(user)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database error while creating user: {exc}",
+        ) from exc
 
-    user = User(
-        email=email,
-        password=hash_password(password)
-    )
-
-    db.add(user)
-    db.commit()
-
-    return {
-        "message": "User created"
-    }
+    return {"message": "User created"}
 
 
 def get_user_status(user: User, db: Session) -> dict:

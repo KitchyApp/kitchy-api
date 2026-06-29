@@ -17,8 +17,8 @@ import secrets
 import warnings
 from datetime import datetime, timedelta
 
+import bcrypt
 from jose import jwt, JWTError
-from passlib.context import CryptContext
 
 # ========================
 # SECRET KEY — ENV ONLY
@@ -48,18 +48,35 @@ REFRESH_TOKEN_EXPIRE_DAYS = 30
 # ========================
 # PASSWORD HASHING
 # ========================
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Uses bcrypt directly instead of passlib to avoid the AttributeError
+# "module 'bcrypt' has no attribute '__about__'" that appears with recent
+# bcrypt versions (>=4.x) paired with older passlib releases.
 
 
 def hash_password(password: str) -> str:
-    """Hash user password using bcrypt."""
-    return pwd_context.hash(password)
+    """
+    Hash a plaintext password with bcrypt.
+
+    bcrypt.hashpw requires bytes input and returns bytes.
+    We encode the password to UTF-8 before hashing and decode the result
+    back to a UTF-8 string for storage in the database.
+    """
+    salt = bcrypt.gensalt()
+    hashed_bytes = bcrypt.hashpw(password.encode("utf-8"), salt)
+    return hashed_bytes.decode("utf-8")
 
 
 def verify_password(password: str, hashed: str) -> bool:
-    """Verify plain password against its bcrypt hash."""
-    return pwd_context.verify(password, hashed)
+    """
+    Verify a plaintext password against a stored bcrypt hash.
+
+    Both arguments are encoded to UTF-8 bytes before being passed to
+    bcrypt.checkpw, which handles the constant-time comparison internally.
+    """
+    return bcrypt.checkpw(
+        password.encode("utf-8"),
+        hashed.encode("utf-8"),
+    )
 
 
 # ========================

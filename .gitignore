@@ -4,27 +4,55 @@
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+dist/
+build/
+*.egg-info/
 
 # =========================
-# ENVIRONMENT
+# ENVIRONMENT & SECRETS
 # =========================
 .env
+.env.*
 *.env
+secrets.json
+*.pem
+*.key
+*.p12
+config.local.py
+
+# =========================
+# VIRTUAL ENVIRONMENTS
+# =========================
 venv/
+.venv/
+env/
+ENV/
 
 # =========================
 # DATABASE
 # =========================
 *.db
+*.sqlite3
 
 # =========================
 # IDE
 # =========================
 .idea/
 .vscode/
+*.iml
 
 # =========================
 # OS
 # =========================
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# =========================
+# LOGS
+# =========================
+*.log
+logs/

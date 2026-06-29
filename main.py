@@ -33,6 +33,30 @@ from typing import List
 from enum import Enum
 
 # ========================
+# ENVIRONMENT — must run first, before ANY other import that reads env vars.
+# override=True forces the .env file to overwrite stale OS-level variables
+# (e.g. old keys cached from a previous PyCharm session or a deleted venv).
+# ========================
+
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
+
+# Fail fast: if critical vars are missing, crash at startup with a clear
+# message instead of getting a cryptic 401 / 500 later at request time.
+_OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
+_DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+if not _OPENAI_KEY:
+    raise RuntimeError(
+        "OPENAI_API_KEY não definida no .env — "
+        "servidor não pode arrancar sem ela."
+    )
+
+if not _DATABASE_URL:
+    raise RuntimeError("DATABASE_URL não definida no .env")
+
+# ========================
 # THIRD-PARTY LIBRARIES
 # ========================
 
@@ -44,7 +68,6 @@ from sqlalchemy import Column, Integer, String, Date, Boolean, DateTime, Index
 from sqlalchemy.orm import Session, Mapped, mapped_column
 from PIL import Image
 from openai import OpenAI
-from dotenv import load_dotenv
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -59,29 +82,25 @@ from dependencies.auth import get_current_user
 # INTERNAL MODULES
 # ========================
 
-from database import Base, engine, SessionLocal
+from database import Base, engine, SessionLocal, run_column_migrations
 from ai.normalization import normalize_ingredients
 from ai.cache import generate_cache_key, get_cached, set_cache
 from routers import favorites
-
 
 
 # ========================
 # ENVIRONMENT CONFIGURATION
 # ========================
 
-load_dotenv()
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL não definido")
+DATABASE_URL = _DATABASE_URL
 
 # Google Play Billing config
 GOOGLE_PACKAGE_NAME = os.getenv("GOOGLE_PACKAGE_NAME")
 
-# OpenAI client
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# OpenAI client — key read explicitly from env (already validated above).
+# Never rely on the OpenAI SDK's own env-var auto-detection: always pass
+# api_key explicitly so the value is visible and traceable at startup.
+client = OpenAI(api_key=_OPENAI_KEY)
 
 # Redis configuration
 redis_url = os.getenv("REDIS_URL")
@@ -106,8 +125,14 @@ logger = structlog.get_logger()
 
 app = FastAPI()
 
-# Create database tables automatically
+# Create tables that don't exist yet.
 Base.metadata.create_all(bind=engine)
+
+# Add any columns that exist in the models but are missing from the physical
+# tables (happens when new fields are added to a model after the initial
+# create_all). This is an append-only, idempotent migration — safe on every
+# startup. Replace with Alembic for production-grade migrations.
+run_column_migrations()
 
 # Register routers (modular API design)
 app.include_router(auth.router, prefix="/auth", tags=["Auth"])
@@ -359,27 +384,115 @@ def verify_purchase(
 
 
 # ========================
+# AI HELPER UTILITIES
+# ========================
+
+
+def _extract_response_text(response) -> str:
+    """
+    Robustly extract the text string from an OpenAI Responses API object.
+
+    The SDK shorthand `response.output_text` works in most cases but can
+    return an empty string when:
+      - the model emits a refusal or safety block (output type != "message")
+      - the SDK version stores content in a nested structure
+
+    Fallback: traverse response.output manually and collect all text blocks.
+    """
+    # 1. Try SDK shorthand
+    text: str = getattr(response, "output_text", "") or ""
+
+    if not text:
+        # 2. Manual traversal: response.output is a list of output items;
+        #    each item may have a .content list of content blocks with .text
+        for item in getattr(response, "output", []):
+            for block in getattr(item, "content", []):
+                fragment = getattr(block, "text", None)
+                if fragment:
+                    text += fragment
+
+    return text.strip()
+
+
+def _strip_markdown_fences(raw: str) -> str:
+    """
+    Remove Markdown code fences that GPT sometimes wraps JSON output in.
+
+    Examples handled:
+        ```json\\n{...}\\n```   →  {...}
+        ```\\n[...]\\n```       →  [...]
+        ```json{...}```        →  {...}
+    """
+    raw = raw.strip()
+
+    # Remove opening fence (```json or just ```)
+    if raw.startswith("```"):
+        # Drop everything up to and including the first newline after the fence
+        newline_pos = raw.find("\n")
+        raw = raw[newline_pos + 1:] if newline_pos != -1 else raw[3:]
+
+    # Remove closing fence
+    if raw.endswith("```"):
+        raw = raw[: raw.rfind("```")]
+
+    return raw.strip()
+
+
+def _parse_openai_json(response, context: str = "") -> object:
+    """
+    Extract text from an OpenAI response, strip Markdown fences, and parse JSON.
+
+    Args:
+        response: OpenAI Responses API response object
+        context:  Label for log messages (e.g. "detect_ingredients")
+
+    Returns:
+        Parsed Python object (dict or list).
+
+    Raises:
+        ValueError with a detailed message (including the raw text) so the
+        caller can decide how to handle the failure.
+    """
+    raw = _extract_response_text(response)
+
+    if not raw:
+        raise ValueError(
+            f"[{context}] OpenAI devolveu uma resposta vazia. "
+            f"Verifique o token limit e o modelo."
+        )
+
+    clean = _strip_markdown_fences(raw)
+
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError as exc:
+        # Log the FULL raw text so we can see exactly what the model sent
+        logger.error(
+            f"[{context}] JSONDecodeError ao fazer parse da resposta OpenAI.",
+            raw_text=raw,
+            clean_text=clean,
+            error=str(exc),
+        )
+        raise ValueError(
+            f"[{context}] Parse JSON falhou: {exc}. "
+            f"Texto recebido (primeiros 500 chars): {raw[:500]!r}"
+        ) from exc
+
+
+# ========================
 # AI FUNCTIONS
 # ========================
 
 
 def detect_ingredients(image_bytes: bytes, language: str = "pt"):
     """
-        Uses OpenAI Vision to detect ingredients from an image.
+    Uses OpenAI Vision to detect ingredients from an image.
 
-        Args:
-            image_bytes: Raw image bytes
-            language: Output language for ingredient names
-
-        Returns:
-            List of detected ingredients with confidence levels
-
-        Notes:
-        - Forces strict JSON output format
-        - Ignores text inside images (important for accuracy)
+    Returns a list of dicts: [{"name": "...", "confidence": "high|medium|low"}]
+    Returns an empty list if detection fails (never raises — callers treat
+    an empty list as "no ingredients found").
     """
 
-    # Convert image to base64 (required by API)
     img_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
     response = client.responses.create(
@@ -390,7 +503,7 @@ def detect_ingredients(image_bytes: bytes, language: str = "pt"):
                 {
                     "type": "input_text",
                     "text": (
-                        "Return ONLY a JSON array.\n"
+                        "Return ONLY a JSON array, no extra text.\n"
                         "[{\"name\":\"\",\"confidence\":\"high|medium|low\"}]\n"
                         "Rules:\n"
                         "- edible food only\n"
@@ -404,14 +517,22 @@ def detect_ingredients(image_bytes: bytes, language: str = "pt"):
                 }
             ]
         }],
-        max_output_tokens=200
+        # 500 tokens — enough for up to ~20 ingredients with confidence values
+        max_output_tokens=500
     )
 
     try:
-        # Parse model output safely
-        return json.loads(response.output_text.strip())
-    except Exception:
-        # Fallback in case of malformed AI response
+        result = _parse_openai_json(response, context="detect_ingredients")
+        if isinstance(result, list):
+            return result
+        # Model returned a dict instead of a list — try to extract array
+        if isinstance(result, dict):
+            for key in ("ingredients", "items", "data"):
+                if isinstance(result.get(key), list):
+                    return result[key]
+        return []
+    except Exception as exc:
+        logger.error("[detect_ingredients] Falha na deteção de ingredientes.", error=str(exc))
         return []
 
 
@@ -531,21 +652,113 @@ async def generate_recipes(
     """
 
     # Call OpenAI
+    # Token budget: 1 recipe ≈ 600–800 tokens; 4 recipes ≈ 2 400–3 200 tokens.
+    # We use 2 000 as a safe ceiling for Free (1 recipe) and bump to 4 000 for
+    # Premium (4 recipes) so the JSON is never truncated mid-object.
+    max_tokens = 2000 if num_recipes == 1 else 4000
+
     response = client.responses.create(
         model="gpt-4.1-mini",
         input=prompt,
-        max_output_tokens=700
+        max_output_tokens=max_tokens,
     )
 
-    parsed = json.loads(response.output_text)
+    try:
+        parsed = _parse_openai_json(response, context="generate_recipes")
+    except ValueError as exc:
+        # Propagate as HTTP 500 with a clear message instead of crashing
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        ) from exc
 
-    # Extract only recipes (important simplification)
-    recipes = parsed["recipes"]
+    # The model should return {"recipes": [...]}.
+    # Guard against it returning the list directly.
+    if isinstance(parsed, list):
+        recipes = parsed
+    else:
+        recipes = parsed.get("recipes", [])
+
+    if not recipes:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "A OpenAI devolveu uma resposta válida mas sem receitas. "
+                "Tenta novamente com outros ingredientes."
+            ),
+        )
 
     # Store in cache (store only useful data)
     await set_cache(cache_key, recipes)
 
     return recipes
+
+
+# ========================
+# TEXT-BASED RECIPE GENERATION
+# ========================
+
+@app.post("/generate-recipes/")
+@limiter.limit("10/minute")
+async def generate_recipes_from_text(
+    request: Request,
+    data: IngredientsRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Generate recipes from a comma-separated ingredients string typed by the user.
+
+    Flow:
+    1. Validate JWT and daily limit (same rules as /analyze-image/)
+    2. Split ingredient text into a list
+    3. Call generate_recipes() with OpenAI
+    4. Increment analyses_today counter
+
+    Returns the same shape as /analyze-image/ so the Flutter client
+    can reuse the same parsing logic.
+    """
+
+    # Detect user language from headers
+    accept_language = request.headers.get("accept-language")
+    language = accept_language.split(",")[0] if accept_language else "pt-PT"
+
+    # Reset daily counter if it is a new day
+    hoje = date.today()
+    if current_user.last_analysis_date != hoje:
+        current_user.analyses_today = 0
+        current_user.last_analysis_date = hoje
+
+    # Enforce plan limits (same as /analyze-image/)
+    limit = 1 if current_user.plan == "free" else 4
+    if current_user.analyses_today >= limit:
+        raise HTTPException(403, "Limite diário atingido")
+
+    # Split the comma-separated string into a clean list
+    raw = data.ingredients.strip()
+    if not raw:
+        raise HTTPException(400, "Nenhum ingrediente fornecido")
+
+    ingredient_list = [i.strip() for i in raw.split(",") if i.strip()]
+    if not ingredient_list:
+        raise HTTPException(400, "Nenhum ingrediente válido fornecido")
+
+    # Generate recipes via OpenAI
+    recipes = await generate_recipes(
+        ingredients=ingredient_list,
+        user=current_user,
+        db=db,
+        language=language,
+    )
+
+    # Increment usage counter
+    current_user.analyses_today += 1
+    db.commit()
+
+    return {
+        "ingredients_detected": ingredient_list,
+        "recipes": recipes,
+    }
 
 
 # ========================

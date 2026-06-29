@@ -10,7 +10,9 @@ Handles:
 Delegates all business logic to the service layer.
 """
 
-from fastapi import APIRouter, Depends
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -19,13 +21,30 @@ from models import User
 from schemas.auth import LoginSchema, RefreshSchema, RegisterSchema
 from services.auth_service import get_user_status, login_user, refresh_tokens, register_user
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
 
 
 @router.post("/register")
 def register(data: RegisterSchema, db: Session = Depends(get_db)):
-    """Register a new user account."""
-    return register_user(db, data.email, data.password)
+    """
+    Register a new user account.
+
+    Returns HTTP 400 if the email is already taken.
+    Returns HTTP 500 with a JSON body on unexpected database errors — never
+    crashes the uvicorn worker with an unhandled traceback.
+    """
+    try:
+        return register_user(db, data.email, data.password)
+    except HTTPException:
+        raise  # 400 / 500 from the service layer — already formatted
+    except Exception as exc:
+        logger.exception("Unexpected error in /auth/register: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error during registration.",
+        ) from exc
 
 
 @router.post("/login")
@@ -37,7 +56,16 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
     - access_token  (short-lived JWT, 15 min)
     - refresh_token (opaque, 30 days, stored hashed in DB)
     """
-    return login_user(db, data.email, data.password)
+    try:
+        return login_user(db, data.email, data.password)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Unexpected error in /auth/login: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error during login.",
+        ) from exc
 
 
 @router.post("/refresh")
