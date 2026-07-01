@@ -12,18 +12,26 @@ def add_favorite(
     user_id: int,
     recipe_title: str,
     recipe_data: dict,
-):
+) -> dict:
     favorite = Favorite(
         user_id=user_id,
         recipe_title=recipe_title,
-        recipe_data=json.dumps(recipe_data),
+        # Persist as JSON text in the TEXT column.
+        recipe_data=json.dumps(recipe_data, ensure_ascii=False),
     )
 
     db.add(favorite)
     db.commit()
     db.refresh(favorite)
 
-    return favorite
+    # Return a plain dict — not the ORM object — so recipe_data is
+    # already a parsed dict and FastAPI serialises it correctly without
+    # needing from_attributes / ORM mode enabled on the response schema.
+    return {
+        "id": favorite.id,
+        "recipe_title": favorite.recipe_title,
+        "recipe_data": recipe_data,
+    }
 
 
 # ============================================================================
@@ -33,18 +41,27 @@ def add_favorite(
 def get_user_favorites(
     db: Session,
     user_id: int,
-):
-    favorites = db.query(Favorite).filter(
-        Favorite.user_id == user_id
-    ).all()
+) -> list[dict]:
+    favorites = (
+        db.query(Favorite)
+        .filter(Favorite.user_id == user_id)
+        # Most recently saved first — Flutter renders top-of-list as newest.
+        .order_by(Favorite.created_at.desc())
+        .all()
+    )
 
     result = []
-
     for fav in favorites:
+        try:
+            recipe_data = json.loads(fav.recipe_data)
+        except (json.JSONDecodeError, TypeError):
+            # Corrupted row — skip rather than crashing the whole list.
+            continue
+
         result.append({
             "id": fav.id,
             "recipe_title": fav.recipe_title,
-            "recipe_data": json.loads(fav.recipe_data),
+            "recipe_data": recipe_data,
         })
 
     return result

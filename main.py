@@ -73,7 +73,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from pydantic import BaseModel, EmailStr, constr
-from models import User, Purchase
+from models import User, Purchase, AnalyticsEvent  # noqa: F401 — AnalyticsEvent must be imported so Base.metadata includes analytics_events in create_all()
 from routers import auth, billing
 from core.security import hash_password
 from dependencies.auth import get_current_user
@@ -86,6 +86,7 @@ from database import Base, engine, SessionLocal, run_column_migrations
 from ai.normalization import normalize_ingredients
 from ai.cache import generate_cache_key, get_cached, set_cache
 from routers import favorites
+from services.analytics_service import log_analytics_event
 
 
 # ========================
@@ -723,16 +724,37 @@ async def generate_recipes_from_text(
     accept_language = request.headers.get("accept-language")
     language = accept_language.split(",")[0] if accept_language else "pt-PT"
 
-    # Reset daily counter if it is a new day
+    # Reset daily counter if it is a new day.
+    # This must happen before the quota check so the first request of a new
+    # day always succeeds regardless of yesterday's analyses_today value.
     hoje = date.today()
     if current_user.last_analysis_date != hoje:
         current_user.analyses_today = 0
         current_user.last_analysis_date = hoje
 
-    # Enforce plan limits (same as /analyze-image/)
-    limit = 1 if current_user.plan == "free" else 4
+    # Quota: only an explicit "premium" plan value earns the higher limit.
+    # Any other value — "free", None, an unexpected string, an expired plan
+    # still in the DB — falls back to the free-tier limit of 1.
+    limit = 4 if current_user.plan == "premium" else 1
+
     if current_user.analyses_today >= limit:
-        raise HTTPException(403, "Limite diário atingido")
+        log_analytics_event(
+            db,
+            event_name="limit_blocked_403",
+            user_id=current_user.id,
+            metadata={
+                "plan": current_user.plan,
+                "analyses_today": current_user.analyses_today,
+                "limit": limit,
+            },
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Limite diário de receitas atingido para o teu plano. "
+                "Faz upgrade para Premium ou aguarda até amanhã!"
+            ),
+        )
 
     # Split the comma-separated string into a clean list
     raw = data.ingredients.strip()
