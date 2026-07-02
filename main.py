@@ -86,6 +86,7 @@ from database import Base, engine, SessionLocal, run_column_migrations
 from ai.normalization import normalize_ingredients
 from ai.cache import generate_cache_key, get_cached, set_cache
 from routers import favorites
+from routers import analytics_admin, maintenance
 from services.analytics_service import log_analytics_event
 
 
@@ -147,6 +148,20 @@ app.include_router(
 
 # Billing routes
 app.include_router(billing.router, prefix="/billing", tags=["Billing"])
+
+# Admin analytics read routes
+app.include_router(
+    analytics_admin.router,
+    prefix="/api/admin/analytics",
+    tags=["Analytics Admin"],
+)
+
+# Admin maintenance routes
+app.include_router(
+    maintenance.router,
+    prefix="/api/admin/maintenance",
+    tags=["Admin Maintenance"],
+)
 
 # ========================
 # RATE LIMITING (ANTI-ABUSE)
@@ -247,6 +262,15 @@ class IngredientsRequest(BaseModel):
     ingredients: str
 
 
+class AnalyticsLogRequest(BaseModel):
+    """
+    Body for POST /analytics/log — sent fire-and-forget by the Flutter client.
+    metadata is stored verbatim as JSON in AnalyticsEvent.metadata_json.
+    """
+    event_name: str
+    metadata: dict = {}
+
+
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: constr(min_length=8)
@@ -263,6 +287,17 @@ class PurchaseRequest(BaseModel):
     """
     purchase_token: str
     product_id: str
+
+
+class PreferencesRequest(BaseModel):
+    """
+    Request schema for saving user dietary preferences and cuisine style.
+    All fields are optional so the client can do a partial update.
+    """
+    dietary_gluten_free: bool = False
+    dietary_vegetarian: bool = False
+    dietary_vegan: bool = False
+    preferred_cuisine: str = "international"
 
 
 # ========================
@@ -485,16 +520,90 @@ def _parse_openai_json(response, context: str = "") -> object:
 # ========================
 
 
-def detect_ingredients(image_bytes: bytes, language: str = "pt"):
+def detect_ingredients(
+    image_bytes: bytes,
+    language: str = "pt",
+    user: "User | None" = None,
+):
     """
-    Uses OpenAI Vision to detect ingredients from an image.
+    Uses OpenAI Vision (gpt-4.1-mini) to detect food ingredients from an image.
 
-    Returns a list of dicts: [{"name": "...", "confidence": "high|medium|low"}]
-    Returns an empty list if detection fails (never raises — callers treat
-    an empty list as "no ingredients found").
+    Args:
+        image_bytes  Raw image bytes (JPEG / PNG / WebP).
+        language     BCP-47 locale string — ingredient names are returned in
+                     the matching language (e.g. "pt-PT" → Portuguese).
+        user         Authenticated User object. When provided, the user's
+                     dietary restrictions are injected into the system prompt
+                     so the model can flag ingredients that conflict with those
+                     restrictions. This gives the recipe generator richer
+                     context for substitutions without altering the output schema.
+
+    Returns:
+        List of dicts:
+            [
+              {
+                "name": "tomate",
+                "confidence": "high|medium|low",
+                "dietary_flag": "restricted|ok"   ← only present when user has restrictions
+              },
+              ...
+            ]
+        Returns an empty list on any failure — callers must treat an empty
+        list as "no ingredients detected" and NEVER raise from here.
     """
 
     img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    # ── Build dietary context section ─────────────────────────────────────────
+    # Only included when the user has at least one active restriction.
+    # The model is instructed to STILL REPORT all visible ingredients (accurate
+    # detection is always more useful than omission), but to annotate any that
+    # conflict with the user's restrictions so the recipe generator can apply
+    # the correct substitutions and hard rules downstream.
+    diet_lines: list[str] = []
+
+    if user is not None:
+        if user.dietary_vegan:
+            diet_lines.append(
+                "User is VEGAN: no animal products (meat, poultry, fish, seafood, "
+                "eggs, dairy, honey, gelatin). Flag any such ingredient as restricted."
+            )
+        elif user.dietary_vegetarian:
+            diet_lines.append(
+                "User is VEGETARIAN: no meat, poultry, fish or seafood. "
+                "Flag any such ingredient as restricted."
+            )
+        if user.dietary_gluten_free:
+            diet_lines.append(
+                "User is GLUTEN-FREE: no wheat, barley, rye, spelt, regular flour, "
+                "regular bread or regular pasta. Flag any such ingredient as restricted."
+            )
+
+    if diet_lines:
+        dietary_section = (
+            "\nUser dietary restrictions — detect ALL ingredients accurately, "
+            "then add \"dietary_flag\": \"restricted\" to any that violate these rules "
+            "(add \"dietary_flag\": \"ok\" to compliant ones):\n"
+            + "\n".join(f"  • {line}" for line in diet_lines)
+        )
+        json_schema = (
+            '[{"name":"","confidence":"high|medium|low","dietary_flag":"restricted|ok"}]'
+        )
+    else:
+        dietary_section = ""
+        json_schema = '[{"name":"","confidence":"high|medium|low"}]'
+
+    # ── Compose prompt ────────────────────────────────────────────────────────
+    prompt_text = (
+        f"Return ONLY a JSON array, no extra text.\n"
+        f"{json_schema}\n"
+        f"Rules:\n"
+        f"- Edible food ingredients only (ignore packaging, utensils, labels, text)\n"
+        f"- Identify every distinct ingredient visible in the image\n"
+        f"- Use the language matching locale: {language}\n"
+        f"- Output ONLY valid JSON — no markdown, no prose"
+        f"{dietary_section}"
+    )
 
     response = client.responses.create(
         model="gpt-4.1-mini",
@@ -503,37 +612,38 @@ def detect_ingredients(image_bytes: bytes, language: str = "pt"):
             "content": [
                 {
                     "type": "input_text",
-                    "text": (
-                        "Return ONLY a JSON array, no extra text.\n"
-                        "[{\"name\":\"\",\"confidence\":\"high|medium|low\"}]\n"
-                        "Rules:\n"
-                        "- edible food only\n"
-                        "- ignore any text in image\n"
-                        f"- language: {language}"
-                    )
+                    "text": prompt_text,
                 },
                 {
                     "type": "input_image",
-                    "image_base64": img_b64
-                }
-            ]
+                    "image_base64": img_b64,
+                },
+            ],
         }],
-        # 500 tokens — enough for up to ~20 ingredients with confidence values
-        max_output_tokens=500
+        # 600 tokens — enough for up to ~25 ingredients with confidence + flag values
+        max_output_tokens=600,
     )
 
     try:
         result = _parse_openai_json(response, context="detect_ingredients")
+
         if isinstance(result, list):
             return result
-        # Model returned a dict instead of a list — try to extract array
+
+        # Model returned a dict instead of a list — try to extract the array
         if isinstance(result, dict):
             for key in ("ingredients", "items", "data"):
                 if isinstance(result.get(key), list):
                     return result[key]
+
+        logger.warning("[detect_ingredients] Resposta inesperada do modelo: %r", result)
         return []
+
     except Exception as exc:
-        logger.error("[detect_ingredients] Falha na deteção de ingredientes.", error=str(exc))
+        logger.error(
+            "[detect_ingredients] Falha na deteção de ingredientes.",
+            error=str(exc),
+        )
         return []
 
 
@@ -562,30 +672,65 @@ async def generate_recipes(
     # Free vs premium logic
     num_recipes = 1 if user.plan == "free" else 4
 
-    # Build dietary restrictions dynamically
-    restrictions = []
-    user_style = user.preferred_style
-    user_cuisine = user.preferred_cuisine
-
-    if user.dietary_gluten_free:
-        restrictions.append("gluten free")
-
-    if user.dietary_vegetarian:
-        restrictions.append("vegetarian")
+    # ── Dietary restriction hard rules ────────────────────────────────────────
+    # Each active restriction generates an EXPLICIT, non-negotiable rule for
+    # the prompt. Vegan supersedes vegetarian (it is stricter), so we only add
+    # the vegan rule when both are active to avoid contradictory instructions.
+    diet_rules: list[str] = []
 
     if user.dietary_vegan:
-        restrictions.append("vegan")
+        diet_rules.append(
+            "STRICT VEGAN — HARD RULE: The recipe MUST NOT contain ANY animal "
+            "products. This includes meat, poultry, fish, seafood, eggs, milk, "
+            "cheese, butter, cream, yogurt, honey, gelatin, or any other "
+            "animal-derived ingredient. If a listed ingredient violates this rule, "
+            "omit it and substitute a plant-based alternative."
+        )
+    elif user.dietary_vegetarian:
+        diet_rules.append(
+            "STRICT VEGETARIAN — HARD RULE: The recipe MUST NOT contain meat, "
+            "poultry, fish, or seafood of any kind. Eggs and dairy are allowed."
+        )
 
-    restrictions_text = ", ".join(restrictions) if restrictions else "none"
+    if user.dietary_gluten_free:
+        diet_rules.append(
+            "STRICT GLUTEN-FREE — HARD RULE: The recipe MUST NOT contain wheat, "
+            "barley, rye, spelt, kamut, regular flour, regular pasta, regular bread, "
+            "regular soy sauce, or any other gluten-containing ingredient. "
+            "Use only certified gluten-free alternatives (e.g. rice flour, "
+            "gluten-free soy sauce/tamari, corn-based pasta)."
+        )
+
+    diet_section = (
+        "\n".join(f"  • {rule}" for rule in diet_rules)
+        if diet_rules
+        else "  • No dietary restrictions — any ingredients are allowed."
+    )
+
+    # ── Cuisine style ─────────────────────────────────────────────────────────
+    user_cuisine = (user.preferred_cuisine or "international").strip()
+    cuisine_instruction = (
+        f"Adapt the flavour profile, spices, and plating style to {user_cuisine} cuisine."
+        if user_cuisine.lower() not in ("international", "internacional", "")
+        else "Keep a balanced international culinary style."
+    )
 
     # Language adaptation instruction
-    language_instruction = f"Generate recipes in {language}. Adapt the culinary style to that country."
+    language_instruction = f"Generate all text in the language that matches locale '{language}'."
 
     # ========================
     # REDIS CACHE (CRITICAL FOR COST + SPEED)
     # ========================
 
-    cache_key = generate_cache_key(ingredients, language)
+    # Include user-specific dietary preferences in the cache key so that two
+    # users with different restrictions never receive each other's cached recipes.
+    import hashlib as _hashlib
+    _prefs_fingerprint = _hashlib.md5(
+        f"{user.dietary_vegan}{user.dietary_vegetarian}"
+        f"{user.dietary_gluten_free}{user_cuisine}".encode()
+    ).hexdigest()[:10]
+
+    cache_key = generate_cache_key(ingredients, language) + f"_{_prefs_fingerprint}"
 
     cached = await get_cached(cache_key)
     if cached:
@@ -596,60 +741,51 @@ async def generate_recipes(
     # ========================
 
     prompt = f"""
-    You are:
-    - Michelin chef
-    - Professional nutritionist
-    - Expert in fast cooking
+    You are a Michelin-star chef, a professional nutritionist, and an expert in fast home cooking.
 
     {language_instruction}
+    {cuisine_instruction}
 
-    User preferences:
-    - Style: {user_style}
-    - Cuisine: {user_cuisine}
+    ══ DIETARY RESTRICTIONS (NON-NEGOTIABLE — NEVER VIOLATE THESE) ══
+{diet_section}
 
-    Ingredients:
+    ══ INGREDIENTS PROVIDED BY THE USER ══
     {", ".join(ingredients)}
 
-    Dietary restrictions:
-    {restrictions_text}
+    ══ RECIPE RULES ══
+    - Max cooking time: 30 minutes
+    - Use ONLY the given ingredients plus universally available staples (salt, pepper, oil, water)
+    - ALL provided ingredients MUST appear in at least one recipe
+    - Mention every ingredient explicitly in the cooking steps
+    - Steps must be detailed, realistic, and written for a home cook
+    - Include preparation steps (washing, chopping, marinating, etc.)
+    - Suggest optional extra ingredients that would enhance the recipe
+    - Provide accurate nutritional values per serving
+    - Output ONLY valid JSON — no markdown fences, no extra text
 
-    Rules:
-    - Max cooking time 30 minutes
-    - Use ONLY given ingredients + basic staples
-    - ALL ingredients MUST be used in the recipe
-    - Mention ingredients explicitly in the cooking steps
-    - Steps must be detailed and realistic
-    - Recipes must feel like real cooking instructions
-    - Include preparation steps for ingredients
-    - Suggest optional extra ingredients to improve the recipe
-    - Provide nutritional values
-    - Output ONLY JSON
-
-    Format:
+    ══ OUTPUT FORMAT ══
     {{
-      "recipes":[
+      "recipes": [
         {{
-          "title":"",
-          "time_minutes":0,
-          "calories":0,
-          "protein_g":0,
-          "carbs_g":0,
-          "fat_g":0,
-          
-          "vitamins":{{
-            "vitamin_a":"",
-            "vitamin_c":"",
-            "vitamin_d":"",
-            "vitamin_b12":""
+          "title": "",
+          "time_minutes": 0,
+          "calories": 0,
+          "protein_g": 0,
+          "carbs_g": 0,
+          "fat_g": 0,
+          "vitamins": {{
+            "vitamin_a": "",
+            "vitamin_c": "",
+            "vitamin_d": "",
+            "vitamin_b12": ""
           }},
-          "optional_ingredients":[],
-          
-          "steps":[]
+          "optional_ingredients": [],
+          "steps": []
         }}
       ]
     }}
 
-    Generate {num_recipes} recipes in JSON.
+    Generate exactly {num_recipes} recipe(s) in JSON. Respect ALL dietary rules above without exception.
     """
 
     # Call OpenAI
@@ -925,27 +1061,53 @@ def reset_password(token: str, new_password: str, db: Session = Depends(get_db))
     return {"message": "Password atualizada"}
 
 
-@app.post("/update-preferences")
-def update_preferences(
-    gluten_free: bool,
-    vegetarian: bool,
-    vegan: bool,
+@app.get("/preferences")
+def get_preferences(
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
 ):
     """
-        Updates user dietary preferences.
-
-        These preferences directly affect recipe generation.
+    Returns the current dietary preferences and cuisine style for the
+    authenticated user.
     """
+    return {
+        "dietary_gluten_free": current_user.dietary_gluten_free,
+        "dietary_vegetarian": current_user.dietary_vegetarian,
+        "dietary_vegan": current_user.dietary_vegan,
+        "preferred_cuisine": current_user.preferred_cuisine,
+    }
 
-    current_user.dietary_gluten_free = gluten_free
-    current_user.dietary_vegetarian = vegetarian
-    current_user.dietary_vegan = vegan
+
+@app.put("/update-preferences")
+def update_preferences(
+    data: PreferencesRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Saves user dietary preferences and preferred cuisine.
+
+    These preferences are applied in real-time on every recipe generation
+    request for the authenticated user.
+
+    Rules enforced by the AI prompt:
+    - vegan       → no meat, fish, eggs, dairy, honey
+    - vegetarian  → no meat or fish
+    - gluten_free → no wheat, barley, rye, regular flour/pasta/bread
+    """
+    current_user.dietary_gluten_free = data.dietary_gluten_free
+    current_user.dietary_vegetarian = data.dietary_vegetarian
+    current_user.dietary_vegan = data.dietary_vegan
+    current_user.preferred_cuisine = data.preferred_cuisine.strip() or "international"
 
     db.commit()
 
-    return {"message": "Preferências atualizadas"}
+    return {
+        "message": "Preferências atualizadas com sucesso",
+        "dietary_gluten_free": current_user.dietary_gluten_free,
+        "dietary_vegetarian": current_user.dietary_vegetarian,
+        "dietary_vegan": current_user.dietary_vegan,
+        "preferred_cuisine": current_user.preferred_cuisine,
+    }
 
 
 @app.get("/health")
@@ -962,6 +1124,34 @@ def health():
 
 
 # ========================
+# CLIENT-SIDE ANALYTICS INGESTION
+# ========================
+
+@app.post("/analytics/log", status_code=204)
+def log_client_event(
+    data: AnalyticsLogRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Receives a single behavioural event emitted by the Flutter client and
+    persists it via analytics_service.log_analytics_event().
+
+    Design contract (mirrors the Flutter AppApi.logEvent() fire-and-forget):
+    - Always returns HTTP 204 No Content on success.
+    - log_analytics_event() never raises — if the DB write fails it is logged
+      server-side and the client sees a 204 regardless.
+    - Rate-limited upstream by the SlowAPI middleware (inherits /10 per minute).
+    """
+    log_analytics_event(
+        db,
+        event_name=data.event_name,
+        user_id=current_user.id,
+        metadata=data.metadata,
+    )
+
+
+# ========================
 # IMAGE ANALYSIS (MAIN PREMIUM FEATURE)
 # ========================
 
@@ -971,72 +1161,111 @@ async def analyze_image(
     request: Request,
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """
-       Main endpoint for image-based recipe generation.
+    Main endpoint for image-based recipe generation.
 
-       Features:
-       - Language auto-detection
-       - Daily usage limits (free vs premium)
-       - Image validation (size + format)
-       - AI ingredient detection + recipe generation
+    Flow:
+    1. Language auto-detection from Accept-Language header
+    2. Daily-counter reset when a new calendar day starts
+    3. Quota enforcement (1 analysis/day free · 4/day premium)
+    4. Image validation: size ≤ 5 MB + PIL integrity check
+    5. AI Vision ingredient detection — user's dietary context injected into
+       the system prompt so the model can flag restricted ingredients upfront
+    6. Recipe generation via generate_recipes() — dietary rules applied strictly
+    7. Counter increment + db.commit()
+
+    All quota blocks are logged to analytics_events for conversion funnel tracking.
     """
 
-    # Detect user language from headers
-    accept_language = request.headers.get("accept-language")
+    # ── Language detection ────────────────────────────────────────────────────
+    accept_language = request.headers.get("accept-language", "")
+    language = accept_language.split(",")[0] if accept_language else "pt-PT"
 
-    if accept_language:
-        language = accept_language.split(",")[0]
-    else:
-        language = "en-US"
-
-    # Reset daily usage counter if new day
+    # ── Daily counter reset (must happen before quota check) ──────────────────
+    # Resetting in-memory before the quota check guarantees the first request
+    # of a new day always succeeds, regardless of yesterday's counter value.
+    # We commit the reset together with the final counter increment at the end,
+    # avoiding an extra round-trip for every non-blocked request.
     hoje = date.today()
-
     if current_user.last_analysis_date != hoje:
         current_user.analyses_today = 0
         current_user.last_analysis_date = hoje
 
-    # Define daily limits
-    limit = 1 if current_user.plan == "free" else 4
+    # ── Quota enforcement ─────────────────────────────────────────────────────
+    # Only an explicit "premium" plan value earns the higher limit.
+    # Any other value — "free", None, an unexpected string, or an expired plan
+    # still lingering in the DB — falls back to the free-tier limit of 1.
+    limit = 4 if current_user.plan == "premium" else 1
 
     if current_user.analyses_today >= limit:
-        raise HTTPException(403, "Limite diário atingido")
+        log_analytics_event(
+            db,
+            event_name="limit_blocked_403",
+            user_id=current_user.id,
+            metadata={
+                "endpoint": "analyze_image",
+                "plan": current_user.plan or "free",
+                "analyses_today": current_user.analyses_today,
+                "limit": limit,
+            },
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Limite diário de {limit} análise(s) de imagem atingido para o teu plano "
+                f"'{current_user.plan or 'free'}'. "
+                "Faz upgrade para Premium para teres 4 análises por dia!"
+            ),
+        )
 
+    # ── Image ingestion ───────────────────────────────────────────────────────
     image_bytes = await file.read()
 
-    # Security: file size limit (~5MB)
     if len(image_bytes) > 5_000_000:
-        raise HTTPException(400, "Imagem demasiado grande")
+        raise HTTPException(400, "Imagem demasiado grande (máximo 5 MB).")
 
-    # Validate image integrity
+    # Validate image integrity before sending to OpenAI — a corrupted or
+    # non-image file would waste a Vision API call and produce a confusing error.
     try:
         Image.open(io.BytesIO(image_bytes)).verify()
     except Exception:
-        raise HTTPException(400, "Imagem inválida")
+        raise HTTPException(400, "Ficheiro inválido ou corrompido. Envia uma imagem JPEG/PNG.")
 
-    # Detect ingredients via AI
-    ingredients = detect_ingredients(image_bytes)
+    # ── AI: ingredient detection (Vision) ────────────────────────────────────
+    # The user's dietary preferences are passed so the model can flag
+    # ingredients that conflict with the user's restrictions. This allows
+    # the downstream recipe generator to apply substitutions with full context.
+    ingredients = detect_ingredients(image_bytes, language=language, user=current_user)
 
-    # Extract names for recipe generation
+    if not ingredients:
+        raise HTTPException(
+            status_code=422,
+            detail="Não foi possível detetar ingredientes na imagem. Tenta com uma foto mais clara.",
+        )
+
+    # Extract names — detect_ingredients returns [{"name": ..., "confidence": ..., ...}]
     ingredient_names = [i["name"] for i in ingredients]
 
-    # Generate recipes
+    # ── AI: recipe generation (with user dietary rules) ───────────────────────
+    # generate_recipes() already injects all dietary restrictions into its
+    # prompt via the user object — no extra work needed here.
     recipes = await generate_recipes(
-        ingredient_names,
-        current_user,
-        db,
-        language=language
+        ingredients=ingredient_names,
+        user=current_user,
+        db=db,
+        language=language,
     )
 
-    # Update usage counter
+    # ── Persist usage counter ─────────────────────────────────────────────────
+    # Single commit: captures daily reset (if it happened) + increment together.
     current_user.analyses_today += 1
     db.commit()
 
     return {
         "ingredients_detected": ingredients,
-        "recipes": recipes
+        "recipes": recipes,
     }
 
 

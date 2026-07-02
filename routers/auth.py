@@ -85,14 +85,17 @@ def user_status(
     db: Session = Depends(get_db),
 ):
     """
-    Return the authenticated user's current plan status.
+    Return the authenticated user's current plan status and identity.
 
     - Requires a valid JWT Bearer token.
     - Auto-downgrades expired premium subscriptions to free before responding.
 
     Response:
+        email       (str)    — user's email address (for profile header display)
         is_premium  (bool)   — true if plan is active premium
         plan        (str)    — "free" | "premium"
         plan_expiry (str|null) — ISO-8601 datetime or null if no expiry set
     """
-    return get_user_status(current_user, db)
+    status = get_user_status(current_user, db)
+    # Merge email into the existing status dict without modifying the service layer.
+    return {**status, "email": current_user.email}
