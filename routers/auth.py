@@ -85,17 +85,29 @@ def user_status(
     db: Session = Depends(get_db),
 ):
     """
-    Return the authenticated user's current plan status and identity.
+    Return the authenticated user's current plan status, identity, and dietary
+    preferences in a single response so the Flutter client only needs one request
+    to hydrate the profile screen.
 
     - Requires a valid JWT Bearer token.
     - Auto-downgrades expired premium subscriptions to free before responding.
 
     Response:
-        email       (str)    — user's email address (for profile header display)
-        is_premium  (bool)   — true if plan is active premium
-        plan        (str)    — "free" | "premium"
-        plan_expiry (str|null) — ISO-8601 datetime or null if no expiry set
+        email                (str)      — user's email address
+        is_premium           (bool)     — true if plan is active premium
+        plan                 (str)      — "free" | "premium"
+        plan_expiry          (str|null) — ISO-8601 datetime or null
+        dietary_gluten_free  (bool)     — gluten-free restriction active
+        dietary_vegetarian   (bool)     — vegetarian restriction active
+        dietary_vegan        (bool)     — vegan restriction active
+        preferred_cuisine    (str)      — e.g. "international", "italian", …
     """
     status = get_user_status(current_user, db)
-    # Merge email into the existing status dict without modifying the service layer.
-    return {**status, "email": current_user.email}
+    return {
+        **status,
+        "email": current_user.email,
+        "dietary_gluten_free": current_user.dietary_gluten_free,
+        "dietary_vegetarian": current_user.dietary_vegetarian,
+        "dietary_vegan": current_user.dietary_vegan,
+        "preferred_cuisine": current_user.preferred_cuisine or "international",
+    }
