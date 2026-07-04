@@ -115,6 +115,31 @@ def run_column_migrations() -> None:
             ("metadata_json", "TEXT"),
             ("created_at",    "TIMESTAMP"),
         ],
+
+        # ── ai_recipe_cache (models/ai_cache.py) ──────────────────────────────
+        # ingredients_hash is the PK — created by create_all(), not here.
+        # Entries below are for future columns added after initial table creation.
+        "ai_recipe_cache": [
+            ("recipe_json",      "TEXT NOT NULL"),
+            ("created_at",       "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+        ],
+
+        # ── chef_challenges (models/challenges.py) ────────────────────────────
+        "chef_challenges": [
+            ("title",                "VARCHAR NOT NULL"),
+            ("required_ingredients", "VARCHAR NOT NULL"),
+            ("is_premium_only",      "INTEGER DEFAULT 0"),
+            ("badge_code",           "VARCHAR DEFAULT '🏅'"),
+            ("created_at",           "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+        ],
+
+        # ── user_challenge_progress (models/challenges.py) ────────────────────
+        "user_challenge_progress": [
+            ("user_id",      "INTEGER NOT NULL"),
+            ("challenge_id", "INTEGER NOT NULL"),
+            ("is_completed", "INTEGER DEFAULT 0"),
+            ("completed_at", "TIMESTAMP"),
+        ],
     }
     # ─────────────────────────────────────────────────────────────────────────
 

@@ -73,8 +73,8 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from pydantic import BaseModel, EmailStr, constr
-from models import User, Purchase, AnalyticsEvent  # noqa: F401 — AnalyticsEvent must be imported so Base.metadata includes analytics_events in create_all()
-from routers import auth, billing
+from models import User, Purchase, AnalyticsEvent, AiRecipeCache, ChefChallenge, UserChallengeProgress  # noqa: F401 — all model classes must be imported so Base.metadata includes their tables in create_all()
+from routers import auth, billing, challenges
 from core.security import hash_password
 from dependencies.auth import get_current_user
 
@@ -148,6 +148,9 @@ app.include_router(
 
 # Billing routes
 app.include_router(billing.router, prefix="/billing", tags=["Billing"])
+
+# Challenges routes
+app.include_router(challenges.router, prefix="/challenges", tags=["Challenges"])
 
 # Admin analytics read routes
 app.include_router(
@@ -654,16 +657,18 @@ async def generate_recipes(
         language: str = "en-US",
 ):
     """
-        Generates recipes using AI based on ingredients and user preferences.
+    Generates recipes using AI based on ingredients and user preferences.
 
-        Features:
-        - Ingredient normalization
-        - Dietary restrictions support
-        - Multi-language support
-        - Redis caching (performance optimization)
+    Cache hierarchy (fastest → slowest):
+      1. DB cache  (AiRecipeCache) — persistent across restarts, checked first.
+      2. Redis cache               — ephemeral but sub-millisecond on hit.
+      3. OpenAI API call           — only reached on full cache miss.
 
-        Returns:
-            List of recipes (already extracted from JSON response)
+    On an OpenAI call the result is written to both Redis and DB so that
+    subsequent requests benefit from whichever layer survives longest.
+
+    Returns:
+        List of recipe dicts (already extracted from JSON).
     """
 
     # Normalize ingredient names (important for consistency + cache hits)
@@ -718,11 +723,39 @@ async def generate_recipes(
     # Language adaptation instruction
     language_instruction = f"Generate all text in the language that matches locale '{language}'."
 
-    # ========================
-    # REDIS CACHE (CRITICAL FOR COST + SPEED)
-    # ========================
+    # =========================================================================
+    # LAYER 1 — DB CACHE (persistent, survives Redis flush / server restart)
+    # =========================================================================
+    # Key encodes every dimension that affects the OpenAI prompt output so that
+    # two users with different plans or dietary preferences never share a cache
+    # entry.  Format (human-readable for easy manual inspection / purging):
+    #
+    #   "arroz,brocolos,frango|1r|lang=pt-PT|gf=0|vg=0|vn=0|c=international"
+    #
+    # Ingredients are sorted alphabetically + lower-cased so that "Frango,Arroz"
+    # and "arroz,frango" resolve to the same key.
+    db_cache_key = (
+        ",".join(sorted(i.lower().strip() for i in ingredients))
+        + f"|{num_recipes}r"
+        + f"|lang={language}"
+        + f"|gf={int(bool(user.dietary_gluten_free))}"
+        + f"|vg={int(bool(user.dietary_vegetarian))}"
+        + f"|vn={int(bool(user.dietary_vegan))}"
+        + f"|c={user_cuisine}"
+    )
 
-    # Include user-specific dietary preferences in the cache key so that two
+    db_hit = db.query(AiRecipeCache).filter(
+        AiRecipeCache.ingredients_hash == db_cache_key
+    ).first()
+
+    if db_hit:
+        logger.info("[generate_recipes] DB cache HIT — key: %.120s", db_cache_key)
+        return json.loads(db_hit.recipe_json)
+
+    # =========================================================================
+    # LAYER 2 — REDIS CACHE (ephemeral but sub-millisecond lookup)
+    # =========================================================================
+    # Include user-specific dietary preferences in the Redis key so that two
     # users with different restrictions never receive each other's cached recipes.
     import hashlib as _hashlib
     _prefs_fingerprint = _hashlib.md5(
@@ -730,10 +763,13 @@ async def generate_recipes(
         f"{user.dietary_gluten_free}{user_cuisine}".encode()
     ).hexdigest()[:10]
 
-    cache_key = generate_cache_key(ingredients, language) + f"_{_prefs_fingerprint}"
+    redis_cache_key = generate_cache_key(ingredients, language) + f"_{_prefs_fingerprint}"
 
-    cached = await get_cached(cache_key)
+    cached = await get_cached(redis_cache_key)
     if cached:
+        # Backfill DB cache so the next request survives a Redis flush.
+        _db_cache_write(db, db_cache_key, cached)
+        logger.info("[generate_recipes] Redis cache HIT — backfilled DB cache.")
         return cached  # instant response (no API cost)
 
     # ========================
@@ -825,10 +861,33 @@ async def generate_recipes(
             ),
         )
 
-    # Store in cache (store only useful data)
-    await set_cache(cache_key, recipes)
+    # ── Write to both cache layers ─────────────────────────────────────────────
+    # Redis write (ephemeral, fast reads on subsequent requests)
+    await set_cache(redis_cache_key, recipes)
+    # DB write (persistent; committed atomically with analyses_today by the caller)
+    _db_cache_write(db, db_cache_key, recipes)
 
     return recipes
+
+
+def _db_cache_write(db: Session, key: str, recipes: list) -> None:
+    """
+    Upsert a recipe list into AiRecipeCache.
+
+    Uses db.merge() (SQL UPSERT semantics) so concurrent requests for the
+    same key are safe — the last writer wins without raising IntegrityError.
+
+    Does NOT commit: the calling endpoint's db.commit() persists this row
+    atomically alongside the analyses_today increment.
+    """
+    try:
+        db.merge(AiRecipeCache(
+            ingredients_hash=key,
+            recipe_json=json.dumps(recipes, ensure_ascii=False),
+        ))
+    except Exception as exc:
+        # Cache write failure must never surface as a user-visible error.
+        logger.warning("[generate_recipes] DB cache write failed: %s", exc)
 
 
 # ========================
