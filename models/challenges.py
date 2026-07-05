@@ -5,7 +5,7 @@ UserChallengeProgress — one row per user per challenge; tracks completion.
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from database import Base
@@ -44,7 +44,7 @@ class ChefChallenge(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
-        server_default="CURRENT_TIMESTAMP",
+        server_default=func.now(),
     )
 
 

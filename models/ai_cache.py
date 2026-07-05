@@ -27,7 +27,7 @@ Cache invalidation:
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, String, Text
+from sqlalchemy import DateTime, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from database import Base
@@ -50,5 +50,5 @@ class AiRecipeCache(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
-        server_default="CURRENT_TIMESTAMP",
+        server_default=func.now(),
     )
