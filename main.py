@@ -152,6 +152,60 @@ app.include_router(billing.router, prefix="/billing", tags=["Billing"])
 # Challenges routes
 app.include_router(challenges.router, prefix="/challenges", tags=["Challenges"])
 
+
+# ========================
+# STARTUP — SEEDING
+# ========================
+
+@app.on_event("startup")
+def _seed_challenges() -> None:
+    """
+    Auto-seed the chef_challenges table on first boot.
+
+    This is idempotent: if the table already has rows the function exits
+    immediately, so re-deploying the server never creates duplicate rows.
+
+    Seeds injected on an empty table:
+      - 1 Free challenge  ("Mestre das Leguminosas")
+      - 2 Premium-only challenges ("Monstro do Ginásio", "Chef de Elite")
+    """
+    db = SessionLocal()
+    try:
+        if db.query(ChefChallenge).count() == 0:
+            seeds = [
+                ChefChallenge(
+                    title="Mestre das Leguminosas",
+                    required_ingredients="grao-de-bico,espinafres",
+                    is_premium_only=False,
+                    badge_code="badge_chickpea",
+                ),
+                ChefChallenge(
+                    title="Monstro do Ginásio",
+                    required_ingredients="frango,ovos",
+                    is_premium_only=True,
+                    badge_code="badge_protein",
+                ),
+                ChefChallenge(
+                    title="Chef de Elite",
+                    required_ingredients="salmao,abacate",
+                    is_premium_only=True,
+                    badge_code="badge_gourmet",
+                ),
+            ]
+            db.add_all(seeds)
+            db.commit()
+            logger.info(
+                "[startup] Seeded %d ChefChallenge rows into empty table.",
+                len(seeds),
+            )
+        else:
+            logger.debug("[startup] ChefChallenge already seeded — skipping.")
+    except Exception as exc:
+        logger.error("[startup] Challenge seed failed: %s", exc)
+    finally:
+        db.close()
+
+
 # Admin analytics read routes
 app.include_router(
     analytics_admin.router,
@@ -723,6 +777,23 @@ async def generate_recipes(
     # Language adaptation instruction
     language_instruction = f"Generate all text in the language that matches locale '{language}'."
 
+    # ── System-level instructions (highest priority in the model context) ─────
+    # Placing dietary restrictions in `instructions` gives them SYSTEM-LEVEL
+    # authority — the model is instructed at the context root, not just inside
+    # the user turn, making it significantly harder for the model to "forget"
+    # the constraints when generating complex multi-step recipes.
+    system_instructions = (
+        "You are a Michelin-star chef, a professional nutritionist, "
+        "and an expert in fast, healthy home cooking.\n\n"
+        f"{language_instruction}\n"
+        f"{cuisine_instruction}\n\n"
+        "══ DIETARY RESTRICTIONS — SYSTEM-LEVEL HARD RULES ══\n"
+        "These rules are ABSOLUTE and NON-NEGOTIABLE. "
+        "They MUST be respected in EVERY recipe, ingredient, step, and suggestion. "
+        "Violating any of the rules below is a critical error.\n\n"
+        f"{diet_section}"
+    )
+
     # =========================================================================
     # LAYER 1 — DB CACHE (persistent, survives Redis flush / server restart)
     # =========================================================================
@@ -775,16 +846,12 @@ async def generate_recipes(
     # ========================
     # PROMPT ENGINEERING
     # ========================
+    # The dietary restrictions are NOT repeated here — they live in
+    # `system_instructions` (passed as `instructions=` to the OpenAI Responses
+    # API) where they receive system-level authority.  Keeping this section
+    # focused on the task reduces token usage and avoids conflicting phrasing.
 
     prompt = f"""
-    You are a Michelin-star chef, a professional nutritionist, and an expert in fast home cooking.
-
-    {language_instruction}
-    {cuisine_instruction}
-
-    ══ DIETARY RESTRICTIONS (NON-NEGOTIABLE — NEVER VIOLATE THESE) ══
-{diet_section}
-
     ══ INGREDIENTS PROVIDED BY THE USER ══
     {", ".join(ingredients)}
 
@@ -821,7 +888,8 @@ async def generate_recipes(
       ]
     }}
 
-    Generate exactly {num_recipes} recipe(s) in JSON. Respect ALL dietary rules above without exception.
+    Generate exactly {num_recipes} recipe(s) in JSON.
+    Respect ALL dietary rules from the system instructions without exception.
     """
 
     # Call OpenAI
@@ -832,7 +900,8 @@ async def generate_recipes(
 
     response = client.responses.create(
         model="gpt-4.1-mini",
-        input=prompt,
+        instructions=system_instructions,   # system-level dietary rules
+        input=prompt,                        # task description + output schema
         max_output_tokens=max_tokens,
     )
 
@@ -959,6 +1028,11 @@ async def generate_recipes_from_text(
     ingredient_list = [i.strip() for i in raw.split(",") if i.strip()]
     if not ingredient_list:
         raise HTTPException(400, "Nenhum ingrediente válido fornecido")
+
+    # Refresh the user row so we always apply the latest dietary preferences —
+    # the JWT token does not carry preferences, so the SQLAlchemy identity map
+    # could hold a stale snapshot if the user updated preferences mid-session.
+    db.refresh(current_user)
 
     # Generate recipes via OpenAI
     recipes = await generate_recipes(
@@ -1291,6 +1365,10 @@ async def analyze_image(
         Image.open(io.BytesIO(image_bytes)).verify()
     except Exception:
         raise HTTPException(400, "Ficheiro inválido ou corrompido. Envia uma imagem JPEG/PNG.")
+
+    # Refresh the user row to guarantee we always apply the latest dietary
+    # preferences before both the Vision call and the recipe generation step.
+    db.refresh(current_user)
 
     # ── AI: ingredient detection (Vision) ────────────────────────────────────
     # The user's dietary preferences are passed so the model can flag
