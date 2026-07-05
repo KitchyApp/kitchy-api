@@ -131,6 +131,10 @@ def run_column_migrations() -> None:
             ("is_premium_only",      "INTEGER DEFAULT 0"),
             ("badge_code",           "VARCHAR DEFAULT '🏅'"),
             ("created_at",           "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            # Weekly rotation fields — added after initial table creation.
+            ("is_active",            "INTEGER DEFAULT 1"),
+            ("week_number",          "INTEGER"),
+            ("week_year",            "INTEGER"),
         ],
 
         # ── user_challenge_progress (models/challenges.py) ────────────────────

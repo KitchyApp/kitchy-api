@@ -23,10 +23,12 @@ Architecture Notes:
 # STANDARD LIBRARIES
 # ========================
 
+import asyncio
 import base64
 import io
 import json
 import os
+import random
 import uuid
 from datetime import date, datetime, timedelta
 from typing import List
@@ -75,6 +77,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from pydantic import BaseModel, EmailStr, constr
 from models import User, Purchase, AnalyticsEvent, AiRecipeCache, ChefChallenge, UserChallengeProgress  # noqa: F401 — all model classes must be imported so Base.metadata includes their tables in create_all()
 from routers import auth, billing, challenges
+from challenges_pool import FREE_CHALLENGES, PREMIUM_CHALLENGES
 from core.security import hash_password
 from dependencies.auth import get_current_user
 
@@ -154,56 +157,174 @@ app.include_router(challenges.router, prefix="/challenges", tags=["Challenges"])
 
 
 # ========================
-# STARTUP — SEEDING
+# WEEKLY CHALLENGE ROTATION
 # ========================
 
-@app.on_event("startup")
-def _seed_challenges() -> None:
+# Number of challenges inserted per rotation run.
+_FREE_PER_WEEK = 1
+_PREMIUM_PER_WEEK = 2
+
+
+def _current_iso_week() -> tuple[int, int]:
+    """Return (iso_year, iso_week) for the current UTC moment."""
+    iso = datetime.utcnow().isocalendar()
+    return int(iso[0]), int(iso[1])   # (year, week)
+
+
+def _needs_rotation(db: Session) -> bool:
     """
-    Auto-seed the chef_challenges table on first boot.
+    Return True when there are NO active challenges tagged for the current
+    ISO week.  This covers two cases:
+      1. First ever boot (empty table).
+      2. Weekly rotation — Monday 00:00 passes and the active set belongs
+         to a previous week.
+    Legacy rows (week_year=NULL) are NOT counted as "current week" so the
+    first run of the rotation system always replaces them.
+    """
+    year, week = _current_iso_week()
+    count = (
+        db.query(ChefChallenge)
+        .filter(
+            ChefChallenge.is_active == True,   # noqa: E712
+            ChefChallenge.week_year == year,
+            ChefChallenge.week_number == week,
+        )
+        .count()
+    )
+    return count == 0
 
-    This is idempotent: if the table already has rows the function exits
-    immediately, so re-deploying the server never creates duplicate rows.
 
-    Seeds injected on an empty table:
-      - 1 Free challenge  ("Mestre das Leguminosas")
-      - 2 Premium-only challenges ("Monstro do Ginásio", "Chef de Elite")
+def _run_rotation(db: Session) -> None:
+    """
+    Weekly rotation:
+      1. Mark all currently-active challenges as inactive.
+      2. Sample _FREE_PER_WEEK + _PREMIUM_PER_WEEK from the pool,
+         avoiding badge codes that were active in the previous cycle.
+      3. Insert the new selection tagged with the current ISO week.
+
+    Uses random.sample() so consecutive weeks are very unlikely to repeat
+    the same challenges (pool size > selection size guarantees this for the
+    default pool of 5+5).
+    """
+    year, week = _current_iso_week()
+
+    # ── Collect badge codes that are currently active (to avoid immediate repeat)
+    previous_badges = {
+        row.badge_code
+        for row in db.query(ChefChallenge.badge_code)
+        .filter(ChefChallenge.is_active == True)   # noqa: E712
+        .all()
+    }
+
+    # ── Deactivate old challenges (keep rows for historical user progress)
+    db.query(ChefChallenge).filter(
+        ChefChallenge.is_active == True   # noqa: E712
+    ).update({"is_active": False}, synchronize_session="fetch")
+
+    # ── Select new challenges, preferring ones not used last week
+    def _prefer_fresh(pool: list[dict], n: int) -> list[dict]:
+        """Sample n items from pool, giving priority to unseen badge codes."""
+        fresh = [c for c in pool if c["badge_code"] not in previous_badges]
+        if len(fresh) >= n:
+            return random.sample(fresh, n)
+        # Not enough fresh items — fall back to the full pool
+        return random.sample(pool, min(n, len(pool)))
+
+    selected: list[dict] = (
+        _prefer_fresh(FREE_CHALLENGES, _FREE_PER_WEEK)
+        + _prefer_fresh(PREMIUM_CHALLENGES, _PREMIUM_PER_WEEK)
+    )
+
+    for tmpl in selected:
+        db.add(ChefChallenge(
+            title=tmpl["title"],
+            required_ingredients=tmpl["required_ingredients"],
+            is_premium_only=tmpl["is_premium_only"],
+            badge_code=tmpl["badge_code"],
+            is_active=True,
+            week_number=week,
+            week_year=year,
+        ))
+
+    db.commit()
+    logger.info(
+        "[rotation] Week %d/%d activated: %s",
+        week, year,
+        [c["title"] for c in selected],
+    )
+
+
+# ── Startup hook — runs rotation immediately if this week has no challenges ───
+
+@app.on_event("startup")
+def _startup_rotation() -> None:
+    """
+    On every server start, check whether the current ISO week already has
+    active challenges.  If not (first boot or Monday after a cold restart),
+    run the rotation immediately so the API always returns fresh data.
     """
     db = SessionLocal()
     try:
-        if db.query(ChefChallenge).count() == 0:
-            seeds = [
-                ChefChallenge(
-                    title="Mestre das Leguminosas",
-                    required_ingredients="grao-de-bico,espinafres",
-                    is_premium_only=False,
-                    badge_code="badge_chickpea",
-                ),
-                ChefChallenge(
-                    title="Monstro do Ginásio",
-                    required_ingredients="frango,ovos",
-                    is_premium_only=True,
-                    badge_code="badge_protein",
-                ),
-                ChefChallenge(
-                    title="Chef de Elite",
-                    required_ingredients="salmao,abacate",
-                    is_premium_only=True,
-                    badge_code="badge_gourmet",
-                ),
-            ]
-            db.add_all(seeds)
-            db.commit()
-            logger.info(
-                "[startup] Seeded %d ChefChallenge rows into empty table.",
-                len(seeds),
-            )
+        if _needs_rotation(db):
+            logger.info("[startup] No active challenges for this week — running rotation.")
+            _run_rotation(db)
         else:
-            logger.debug("[startup] ChefChallenge already seeded — skipping.")
+            logger.debug("[startup] Active challenges found for this week — skipping rotation.")
     except Exception as exc:
-        logger.error("[startup] Challenge seed failed: %s", exc)
+        logger.error("[startup] Startup rotation failed: %s", exc)
     finally:
         db.close()
+
+
+# ── Background async worker — fires rotation every Monday 00:00 UTC ──────────
+
+async def _weekly_rotation_worker() -> None:
+    """
+    Long-running coroutine that wakes up every Monday at 00:00 UTC and
+    runs the weekly challenge rotation.
+
+    Sleep strategy
+    --------------
+    Compute seconds until the next Monday 00:00 UTC and sleep exactly that
+    long.  After each wake-up, re-check whether rotation is still needed
+    (guards against duplicate rotations if the worker is restarted and the
+    startup hook already ran for the current week).
+    """
+    while True:
+        now = datetime.utcnow()
+
+        # days_until_monday: 0 if today is Monday, else 1-6.
+        # If it's already Monday add 7 so we sleep until NEXT Monday rather
+        # than waking up immediately (startup hook already handles today).
+        days_ahead = (7 - now.weekday()) % 7 or 7
+        next_monday = (now + timedelta(days=days_ahead)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        sleep_secs = (next_monday - now).total_seconds()
+
+        logger.info(
+            "[rotation-worker] Sleeping %.0f s until next Monday %s UTC.",
+            sleep_secs,
+            next_monday.strftime("%Y-%m-%d %H:%M"),
+        )
+        await asyncio.sleep(sleep_secs)
+
+        db = SessionLocal()
+        try:
+            if _needs_rotation(db):
+                _run_rotation(db)
+            else:
+                logger.debug("[rotation-worker] Rotation already ran for this week.")
+        except Exception as exc:
+            logger.error("[rotation-worker] Rotation failed: %s", exc)
+        finally:
+            db.close()
+
+
+@app.on_event("startup")
+async def _start_weekly_rotation_worker() -> None:
+    """Kick off the Monday-rotation background coroutine at server start."""
+    asyncio.create_task(_weekly_rotation_worker())
 
 
 # Admin analytics read routes

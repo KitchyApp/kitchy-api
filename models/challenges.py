@@ -1,6 +1,22 @@
 """
-ChefChallenge  — curated cooking challenges seeded by admins.
+ChefChallenge  — curated cooking challenges, rotated weekly by the scheduler.
 UserChallengeProgress — one row per user per challenge; tracks completion.
+
+Weekly rotation fields
+----------------------
+is_active    : Only active challenges are returned by GET /challenges.
+               The scheduler sets this to False for the previous week's
+               challenges before inserting the new week's selection.
+week_number  : ISO week number (1-53) during which the challenge was activated.
+week_year    : ISO year — needed to disambiguate week 1 across year boundaries.
+               Both fields together form a unique week identifier.
+
+Rotation contract
+-----------------
+- 1 Free  challenge is selected from the pool each week.
+- 2 Premium challenges are selected from the pool each week.
+- Rotation fires on Monday 00:00 UTC (or on server startup when no active
+  challenges exist for the current ISO week).
 """
 
 from datetime import datetime
@@ -33,13 +49,29 @@ class ChefChallenge(Base):
         server_default="0",
     )
 
-    # Short emoji / icon code awarded when the challenge is completed.
-    # Example: "🥗", "🌱", "🏆"
+    # Short code / emoji for the badge awarded on completion.
     badge_code: Mapped[str] = mapped_column(
         String,
         default="🏅",
         server_default="🏅",
     )
+
+    # ── Weekly rotation fields ─────────────────────────────────────────────────
+
+    # False once the scheduler replaces this challenge with a newer one.
+    # GET /challenges filters WHERE is_active = 1.
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default="1",
+    )
+
+    # ISO week number in which this challenge was made active (nullable for
+    # legacy rows inserted before the rotation system was added).
+    week_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # ISO year matching week_number — required to handle week-1 of a new year.
+    week_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime,

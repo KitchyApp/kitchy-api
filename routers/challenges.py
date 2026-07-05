@@ -87,7 +87,12 @@ def list_challenges(
     """
     is_premium = current_user.plan == "premium"
 
-    challenges = db.query(ChefChallenge).order_by(ChefChallenge.id).all()
+    challenges = (
+        db.query(ChefChallenge)
+        .filter(ChefChallenge.is_active == True)   # noqa: E712
+        .order_by(ChefChallenge.is_premium_only.asc(), ChefChallenge.id.asc())
+        .all()
+    )
 
     # Batch-load all progress rows for this user to avoid N+1 queries.
     progress_map: dict[int, UserChallengeProgress] = {
@@ -108,8 +113,7 @@ def list_challenges(
             "required_ingredients": ch.required_ingredients,
             "is_premium_only":      ch.is_premium_only,
             "is_locked":            is_locked,
-            # Hide the badge emoji for locked challenges so it can't be
-            # scraped from the API response to show in the UI for free.
+            # Hide the badge for locked challenges so it cannot be scraped.
             "badge_code":           ch.badge_code if not is_locked else "🔒",
             "is_completed":         bool(progress and progress.is_completed),
             "completed_at": (
@@ -117,6 +121,9 @@ def list_challenges(
                 if (progress and progress.completed_at)
                 else None
             ),
+            # Rotation metadata — lets the frontend show "Semana X" if desired.
+            "week_number": ch.week_number,
+            "week_year":   ch.week_year,
         })
 
     return result
