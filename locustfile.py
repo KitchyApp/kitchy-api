@@ -29,10 +29,10 @@ Two test accounts are needed.  They are auto-registered on the first run if
 they do not already exist.  Re-runs detect an existing account (HTTP 400 on
 /auth/register) and fall through to login — fully idempotent.
 
-    GENERAL_EMAIL   = kitchy_load_{worker_id}@test.local   (one per Locust worker)
-    QUOTA_EMAIL     = kitchy_quota@test.local   (shared by ALL QuotaRaceUser instances)
+    GENERAL_EMAIL   = kitchy_load_{worker_id}@example.com   (one per Locust worker)
+    QUOTA_EMAIL     = kitchy_quota@example.com   (shared by ALL QuotaRaceUser instances)
 
-    PASSWORD (both) = Load#Test99!
+    PASSWORD (both) = Load#Test99!   (min 8 chars — matches RegisterSchema / LoginSchema)
 
 Interpreting results
 --------------------
@@ -63,15 +63,17 @@ _REGISTER_PATH = "/auth/register"
 _GENERATE_PATH = "/generate-recipes/"
 _STATUS_PATH   = "/auth/user/status"
 
-# Shared credentials
+# Shared credentials — must satisfy schemas.auth.RegisterSchema / LoginSchema:
+#   email:    EmailStr  (valid RFC email)
+#   password: constr(min_length=8)
 _PASSWORD = "Load#Test99!"
 
 # General load-test account (each worker registers its own to isolate quotas)
-_GENERAL_EMAIL_TEMPLATE = "kitchy_load_{worker_id}@test.local"
+_GENERAL_EMAIL_TEMPLATE = "kitchy_load_{worker_id}@example.com"
 
 # Quota race account — intentionally SHARED across all QuotaRaceUser instances
 # so they all compete for the single free-tier analysis slot.
-_QUOTA_EMAIL = "kitchy_quota@test.local"
+_QUOTA_EMAIL = "kitchy_quota@example.com"
 
 # Fixed ingredient string for cache-stress test — must be identical on every
 # request so the backend key always resolves to the same cache entry.
@@ -107,6 +109,28 @@ def _auth_header(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _register_payload(email: str, password: str) -> dict:
+    """
+    Body for POST /auth/register — mirrors schemas.auth.RegisterSchema exactly.
+
+    Required fields (no optional / dietary fields on register):
+        email:    EmailStr
+        password: constr(min_length=8)
+    """
+    return {"email": email, "password": password}
+
+
+def _login_payload(email: str, password: str) -> dict:
+    """
+    Body for POST /auth/login — mirrors schemas.auth.LoginSchema exactly.
+
+    Required fields:
+        email:    EmailStr   (NOT "username")
+        password: constr(min_length=8)
+    """
+    return {"email": email, "password": password}
+
+
 def _register_or_ignore(client, email: str, password: str) -> None:
     """
     Attempt to register.  HTTP 400 ("email already taken") is silently
@@ -115,7 +139,7 @@ def _register_or_ignore(client, email: str, password: str) -> None:
     """
     with client.post(
         _REGISTER_PATH,
-        json={"email": email, "password": password},
+        json=_register_payload(email, password),
         name="[AUTH] POST /auth/register",
         catch_response=True,
     ) as response:
@@ -124,6 +148,10 @@ def _register_or_ignore(client, email: str, password: str) -> None:
         elif response.status_code == 400:
             # Account already exists — expected on re-runs.
             response.success()
+        elif response.status_code == 422:
+            response.failure(
+                f"Register validation failed (422): {response.text[:300]}"
+            )
         else:
             response.failure(
                 f"Register failed: HTTP {response.status_code} — {response.text[:200]}"
@@ -137,7 +165,7 @@ def _login(client, email: str, password: str) -> Optional[str]:
     """
     with client.post(
         _LOGIN_PATH,
-        json={"email": email, "password": password},
+        json=_login_payload(email, password),
         name="[AUTH] POST /auth/login",
         catch_response=True,
     ) as resp:
@@ -147,6 +175,10 @@ def _login(client, email: str, password: str) -> Optional[str]:
                 resp.success()
                 return token
             resp.failure("Login succeeded but access_token missing in response.")
+        elif resp.status_code == 422:
+            resp.failure(
+                f"Login validation failed (422): {resp.text[:300]}"
+            )
         else:
             resp.failure(
                 f"Login failed: HTTP {resp.status_code} — {resp.text[:200]}"
