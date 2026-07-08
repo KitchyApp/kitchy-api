@@ -13,11 +13,13 @@ Delegates all business logic to the service layer.
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
 from database import get_db
 from dependencies.auth import get_current_user
 from models import User
+from models.challenges import ChefChallenge, UserChallengeProgress
 from schemas.auth import LoginSchema, RefreshSchema, RegisterSchema
 from services.auth_service import get_user_status, login_user, refresh_tokens, register_user
 
@@ -103,6 +105,22 @@ def user_status(
         preferred_cuisine    (str)      — e.g. "international", "italian", …
     """
     status = get_user_status(current_user, db)
+
+    # Collect badge codes for every challenge the user has completed.
+    earned_badge_rows = (
+        db.query(ChefChallenge.badge_code)
+        .join(
+            UserChallengeProgress,
+            and_(
+                UserChallengeProgress.challenge_id == ChefChallenge.id,
+                UserChallengeProgress.user_id == current_user.id,
+                UserChallengeProgress.is_completed == True,  # noqa: E712
+            ),
+        )
+        .all()
+    )
+    earned_badges = [row[0] for row in earned_badge_rows if row[0]]
+
     return {
         **status,
         "email": current_user.email,
@@ -110,4 +128,5 @@ def user_status(
         "dietary_vegetarian": current_user.dietary_vegetarian,
         "dietary_vegan": current_user.dietary_vegan,
         "preferred_cuisine": current_user.preferred_cuisine or "international",
+        "earned_badges": earned_badges,
     }
