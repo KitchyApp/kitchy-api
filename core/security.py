@@ -42,7 +42,7 @@ SECRET_KEY: str = _secret
 # ========================
 
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 15
+ACCESS_TOKEN_EXPIRE_DAYS = 7
 REFRESH_TOKEN_EXPIRE_DAYS = 30
 
 # ========================
@@ -73,25 +73,35 @@ def verify_password(password: str, hashed: str) -> bool:
     Both arguments are encoded to UTF-8 bytes before being passed to
     bcrypt.checkpw, which handles the constant-time comparison internally.
     """
-    return bcrypt.checkpw(
-        password.encode("utf-8"),
-        hashed.encode("utf-8"),
-    )
+    if not password or not hashed:
+        return False
+    try:
+        return bcrypt.checkpw(
+            password.encode("utf-8"),
+            hashed.encode("utf-8"),
+        )
+    except (ValueError, TypeError):
+        return False
 
 
 # ========================
 # ACCESS TOKEN (JWT)
 # ========================
 
-def create_access_token(data: dict) -> str:
+def create_access_token(
+    data: dict,
+    expires_delta: timedelta | None = None,
+) -> str:
     """
-    Create a short-lived JWT access token.
+    Create a JWT access token.
 
     The payload must include 'user_id' as the identity claim.
-    Expiration is controlled by ACCESS_TOKEN_EXPIRE_MINUTES.
+    Default expiration is ACCESS_TOKEN_EXPIRE_DAYS (7 days).
     """
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.utcnow() + (
+        expires_delta or timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS)
+    )
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 

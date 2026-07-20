@@ -55,7 +55,7 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
     Authenticate with email + password.
 
     Returns:
-    - access_token  (short-lived JWT, 15 min)
+    - access_token  (JWT, 7 days)
     - refresh_token (opaque, 30 days, stored hashed in DB)
     """
     try:

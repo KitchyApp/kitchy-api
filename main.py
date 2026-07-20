@@ -185,7 +185,7 @@ def _needs_rotation(db: Session) -> bool:
     count = (
         db.query(ChefChallenge)
         .filter(
-            ChefChallenge.is_active == True,   # noqa: E712
+            ChefChallenge.is_active == 1,
             ChefChallenge.week_year == year,
             ChefChallenge.week_number == week,
         )
@@ -212,14 +212,14 @@ def _run_rotation(db: Session) -> None:
     previous_badges = {
         row.badge_code
         for row in db.query(ChefChallenge.badge_code)
-        .filter(ChefChallenge.is_active == True)   # noqa: E712
+        .filter(ChefChallenge.is_active == 1)
         .all()
     }
 
     # ── Deactivate old challenges (keep rows for historical user progress)
     db.query(ChefChallenge).filter(
-        ChefChallenge.is_active == True   # noqa: E712
-    ).update({"is_active": False}, synchronize_session="fetch")
+        ChefChallenge.is_active == 1
+    ).update({"is_active": 0}, synchronize_session="fetch")
 
     # ── Select new challenges, preferring ones not used last week
     def _prefer_fresh(pool: list[dict], n: int) -> list[dict]:
@@ -241,7 +241,7 @@ def _run_rotation(db: Session) -> None:
             required_ingredients=tmpl["required_ingredients"],
             is_premium_only=tmpl["is_premium_only"],
             badge_code=tmpl["badge_code"],
-            is_active=True,
+            is_active=1,
             week_number=week,
             week_year=year,
         ))
@@ -1487,8 +1487,7 @@ async def analyze_image(
     except Exception:
         raise HTTPException(400, "Ficheiro inválido ou corrompido. Envia uma imagem JPEG/PNG.")
 
-    # Refresh the user row to guarantee we always apply the latest dietary
-    # preferences before both the Vision call and the recipe generation step.
+    current_user = db.query(current_user.__class__).filter(current_user.__class__.id == current_user.id).first()
     db.refresh(current_user)
 
     # ── AI: ingredient detection (Vision) ────────────────────────────────────
