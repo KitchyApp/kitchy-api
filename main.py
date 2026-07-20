@@ -1517,6 +1517,7 @@ async def analyze_image(
 
     # ── Persist usage counter ─────────────────────────────────────────────────
     # Single commit: captures daily reset (if it happened) + increment together.
+    current_user = db.merge(current_user)
     current_user.analyses_today += 1
     db.commit()
 
