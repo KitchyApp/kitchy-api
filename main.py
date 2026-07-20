@@ -589,8 +589,10 @@ def verify_purchase(
 
     db.add(purchase)
 
-    # Upgrade user immediately
+    # Upgrade user immediately — merge reattaches the JWT user to this session.
+    current_user = db.merge(current_user)
     current_user.plan = "premium"
+    current_user.plan_expiry = expires_at
     db.commit()
 
     return {"status": "premium_activated", "expires_at": expires_at}
