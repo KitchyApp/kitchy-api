@@ -793,8 +793,8 @@ def detect_ingredients(
                     "text": prompt_text,
                 },
                 {
-                    "type": "input_image",
-                    "image_base64": img_b64,
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
                 },
             ],
         }],
