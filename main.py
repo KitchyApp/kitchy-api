@@ -66,7 +66,7 @@ import redis
 import structlog
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
-from sqlalchemy import Column, Integer, String, Date, Boolean, DateTime, Index
+from sqlalchemy import Column, Integer, String, Date, Boolean, DateTime, Index, text
 from sqlalchemy.orm import Session, Mapped, mapped_column
 from PIL import Image
 from openai import OpenAI
@@ -217,9 +217,8 @@ def _run_rotation(db: Session) -> None:
     }
 
     # ── Deactivate old challenges (keep rows for historical user progress)
-    db.query(ChefChallenge).filter(
-        ChefChallenge.is_active == 1
-    ).update({"is_active": 0}, synchronize_session="fetch")
+    # Column is INTEGER in PostgreSQL — use literal 0, not ORM boolean False.
+    db.execute(text("UPDATE chef_challenges SET is_active = 0 WHERE is_active = 1"))
 
     # ── Select new challenges, preferring ones not used last week
     def _prefer_fresh(pool: list[dict], n: int) -> list[dict]:
@@ -617,8 +616,15 @@ def _extract_response_text(response) -> str:
     text: str = getattr(response, "output_text", "") or ""
 
     if not text:
-        # 2. Manual traversal: response.output is a list of output items;
-        #    each item may have a .content list of content blocks with .text
+        # Chat Completions API (choices[0].message.content)
+        choices = getattr(response, "choices", None)
+        if choices:
+            message = getattr(choices[0], "message", None)
+            if message is not None:
+                text = getattr(message, "content", "") or ""
+
+    if not text:
+        # Responses API: traverse response.output manually
         for item in getattr(response, "output", []):
             for block in getattr(item, "content", []):
                 fragment = getattr(block, "text", None)
@@ -783,23 +789,21 @@ def detect_ingredients(
         f"{dietary_section}"
     )
 
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "input_text",
-                    "text": prompt_text,
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
-                },
-            ],
-        }],
-        # 600 tokens — enough for up to ~25 ingredients with confidence + flag values
-        max_output_tokens=600,
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt_text},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                    },
+                ],
+            }
+        ],
+        max_tokens=600,
     )
 
     try:
