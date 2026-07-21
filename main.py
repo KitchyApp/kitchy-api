@@ -598,6 +598,22 @@ def verify_purchase(
     return {"status": "premium_activated", "expires_at": expires_at}
 
 
+@app.post("/auth/subscribe")
+def subscribe(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Activate Premium for the authenticated user (dev / profile upgrade path).
+
+    Relies on the JWT Bearer token to identify the active user.
+    """
+    current_user = db.merge(current_user)
+    current_user.plan = "premium"
+    db.commit()
+    return {"status": "premium_activated"}
+
+
 # ========================
 # AI HELPER UTILITIES
 # ========================
