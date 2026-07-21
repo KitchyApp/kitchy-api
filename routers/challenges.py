@@ -89,7 +89,7 @@ def list_challenges(
 
     challenges = (
         db.query(ChefChallenge)
-        .filter(ChefChallenge.is_active == True)   # noqa: E712
+        .filter(ChefChallenge.is_active == 1)
         .order_by(ChefChallenge.is_premium_only.asc(), ChefChallenge.id.asc())
         .all()
     )

@@ -58,11 +58,12 @@ class ChefChallenge(Base):
 
     # ── Weekly rotation fields ─────────────────────────────────────────────────
 
-    # False once the scheduler replaces this challenge with a newer one.
+    # 0 once the scheduler replaces this challenge with a newer one.
     # GET /challenges filters WHERE is_active = 1.
-    is_active: Mapped[bool] = mapped_column(
-        Boolean,
-        default=True,
+    # INTEGER to match the real PostgreSQL column (avoids DatatypeMismatch).
+    is_active: Mapped[int] = mapped_column(
+        Integer,
+        default=1,
         server_default="1",
     )
 
