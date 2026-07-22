@@ -19,7 +19,7 @@ router = APIRouter()
 # matching the Flutter client's apiClient.post('/favorites', ...) directly
 # without relying on a 307 redirect that some HTTP stacks mishandle on POST.
 
-@router.post("", response_model=FavoriteResponse, status_code=200)
+@router.post("", response_model=FavoriteResponse, status_code=201)
 def create_favorite(
     data: FavoriteCreate,
     db: Session = Depends(get_db),
@@ -28,10 +28,14 @@ def create_favorite(
     """
     Save a generated recipe to the authenticated user's favourites.
 
-    Accepts the full recipe payload (title + structured data) and persists
-    it as a JSON blob in the favorites table.  Returns the new favourite's
-    id so the Flutter client can later call DELETE /favorites/{id}.
+    Accepts the full recipe payload (title + structured data: ingredients,
+    steps, macros, …) and persists it as a JSON blob in the favorites table.
+    Returns the favourite/recipe id so the Flutter client can later call
+    DELETE /favorites/{id}.
     """
+    # Reattach JWT user to this session before any writes.
+    current_user = db.merge(current_user)
+
     return add_favorite(
         db=db,
         user_id=current_user.id,

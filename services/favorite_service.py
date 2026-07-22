@@ -13,6 +13,27 @@ def add_favorite(
     recipe_title: str,
     recipe_data: dict,
 ) -> dict:
+    # Reuse an existing favourite for this user + title (idempotent save).
+    existing = (
+        db.query(Favorite)
+        .filter(
+            Favorite.user_id == user_id,
+            Favorite.recipe_title == recipe_title,
+        )
+        .first()
+    )
+
+    if existing:
+        try:
+            stored = json.loads(existing.recipe_data)
+        except (json.JSONDecodeError, TypeError):
+            stored = recipe_data
+        return {
+            "id": existing.id,
+            "recipe_title": existing.recipe_title,
+            "recipe_data": stored if isinstance(stored, dict) else recipe_data,
+        }
+
     favorite = Favorite(
         user_id=user_id,
         recipe_title=recipe_title,
