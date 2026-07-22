@@ -91,6 +91,8 @@ from ai.cache import generate_cache_key, get_cached, set_cache
 from routers import favorites
 from routers import analytics_admin, maintenance
 from services.analytics_service import log_analytics_event
+from schemas.favorite import FavoriteCreate
+from services.favorite_service import add_favorite
 
 
 # ========================
@@ -612,6 +614,25 @@ def subscribe(
     current_user.plan = "premium"
     db.commit()
     return {"status": "premium_activated"}
+
+
+@app.post("/recipes/favorite", status_code=201)
+def recipe_favorite(
+    data: FavoriteCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Persist a full AI-generated recipe as a favourite for the current user.
+    Alias path used by the Flutter recipe detail heart button.
+    """
+    current_user = db.merge(current_user)
+    return add_favorite(
+        db=db,
+        user_id=current_user.id,
+        recipe_title=data.recipe_title,
+        recipe_data=data.recipe_data,
+    )
 
 
 # ========================
