@@ -64,7 +64,7 @@ if not _DATABASE_URL:
 
 import redis
 import structlog
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy import Column, Integer, String, Date, Boolean, DateTime, Index, text
 from sqlalchemy.orm import Session, Mapped, mapped_column
@@ -747,6 +747,7 @@ def detect_ingredients(
     image_bytes: bytes,
     language: str = "pt",
     user: "User | None" = None,
+    is_barman: bool = False,
 ):
     """
     Uses OpenAI Vision (gpt-4.1-mini) to detect food ingredients from an image.
@@ -760,6 +761,8 @@ def detect_ingredients(
                      so the model can flag ingredients that conflict with those
                      restrictions. This gives the recipe generator richer
                      context for substitutions without altering the output schema.
+        is_barman    When True, switches Vision to mixology mode: ignore solid
+                     foods, detect alcohol bottle brands/labels, focus on bar stock.
 
     Returns:
         List of dicts:
@@ -777,56 +780,66 @@ def detect_ingredients(
 
     img_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-    # ── Build dietary context section ─────────────────────────────────────────
-    # Only included when the user has at least one active restriction.
-    # The model is instructed to STILL REPORT all visible ingredients (accurate
-    # detection is always more useful than omission), but to annotate any that
-    # conflict with the user's restrictions so the recipe generator can apply
-    # the correct substitutions and hard rules downstream.
-    diet_lines: list[str] = []
-
-    if user is not None:
-        if user.dietary_vegan:
-            diet_lines.append(
-                "User is VEGAN: no animal products (meat, poultry, fish, seafood, "
-                "eggs, dairy, honey, gelatin). Flag any such ingredient as restricted."
-            )
-        elif user.dietary_vegetarian:
-            diet_lines.append(
-                "User is VEGETARIAN: no meat, poultry, fish or seafood. "
-                "Flag any such ingredient as restricted."
-            )
-        if user.dietary_gluten_free:
-            diet_lines.append(
-                "User is GLUTEN-FREE: no wheat, barley, rye, spelt, regular flour, "
-                "regular bread or regular pasta. Flag any such ingredient as restricted."
-            )
-
-    if diet_lines:
-        dietary_section = (
-            "\nUser dietary restrictions — detect ALL ingredients accurately, "
-            "then add \"dietary_flag\": \"restricted\" to any that violate these rules "
-            "(add \"dietary_flag\": \"ok\" to compliant ones):\n"
-            + "\n".join(f"  • {line}" for line in diet_lines)
-        )
-        json_schema = (
-            '[{"name":"","confidence":"high|medium|low","dietary_flag":"restricted|ok"}]'
+    if is_barman:
+        # ── BARMAN / MIXOLOGY VISION ──────────────────────────────────────────
+        prompt_text = (
+            "You are an aggressive expert mixologist and bottle-label computer-vision system.\n"
+            "Return ONLY a JSON array, no extra text.\n"
+            '[{"name":"","confidence":"high|medium|low","brand":""}]\n'
+            "HARD RULES:\n"
+            "- IGNORE all solid foods completely (meat, vegetables, bread, etc.).\n"
+            "- Focus PURELY on mixology: spirits, liqueurs, wines, beers, mixers, "
+            "garnishes, syrups, bitters, ice, citrus for drinks.\n"
+            "- Use computer vision to READ bottle brands and alcohol labels in the image.\n"
+            "- Put the brand in \"brand\" when readable; put the spirit/ingredient in \"name\".\n"
+            f"- Use the language matching locale: {language}\n"
+            "- Output ONLY valid JSON — no markdown, no prose"
         )
     else:
-        dietary_section = ""
-        json_schema = '[{"name":"","confidence":"high|medium|low"}]'
+        # ── Build dietary context section ─────────────────────────────────────
+        diet_lines: list[str] = []
 
-    # ── Compose prompt ────────────────────────────────────────────────────────
-    prompt_text = (
-        f"Return ONLY a JSON array, no extra text.\n"
-        f"{json_schema}\n"
-        f"Rules:\n"
-        f"- Edible food ingredients only (ignore packaging, utensils, labels, text)\n"
-        f"- Identify every distinct ingredient visible in the image\n"
-        f"- Use the language matching locale: {language}\n"
-        f"- Output ONLY valid JSON — no markdown, no prose"
-        f"{dietary_section}"
-    )
+        if user is not None:
+            if user.dietary_vegan:
+                diet_lines.append(
+                    "User is VEGAN: no animal products (meat, poultry, fish, seafood, "
+                    "eggs, dairy, honey, gelatin). Flag any such ingredient as restricted."
+                )
+            elif user.dietary_vegetarian:
+                diet_lines.append(
+                    "User is VEGETARIAN: no meat, poultry, fish or seafood. "
+                    "Flag any such ingredient as restricted."
+                )
+            if user.dietary_gluten_free:
+                diet_lines.append(
+                    "User is GLUTEN-FREE: no wheat, barley, rye, spelt, regular flour, "
+                    "regular bread or regular pasta. Flag any such ingredient as restricted."
+                )
+
+        if diet_lines:
+            dietary_section = (
+                "\nUser dietary restrictions — detect ALL ingredients accurately, "
+                "then add \"dietary_flag\": \"restricted\" to any that violate these rules "
+                "(add \"dietary_flag\": \"ok\" to compliant ones):\n"
+                + "\n".join(f"  • {line}" for line in diet_lines)
+            )
+            json_schema = (
+                '[{"name":"","confidence":"high|medium|low","dietary_flag":"restricted|ok"}]'
+            )
+        else:
+            dietary_section = ""
+            json_schema = '[{"name":"","confidence":"high|medium|low"}]'
+
+        prompt_text = (
+            f"Return ONLY a JSON array, no extra text.\n"
+            f"{json_schema}\n"
+            f"Rules:\n"
+            f"- Edible food ingredients only (ignore packaging, utensils, labels, text)\n"
+            f"- Identify every distinct ingredient visible in the image\n"
+            f"- Use the language matching locale: {language}\n"
+            f"- Output ONLY valid JSON — no markdown, no prose"
+            f"{dietary_section}"
+        )
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -873,6 +886,7 @@ async def generate_recipes(
         user: User,
         db: Session,
         language: str = "en-US",
+        is_barman: bool = False,
 ):
     """
     Generates recipes using AI based on ingredients and user preferences.
@@ -895,127 +909,113 @@ async def generate_recipes(
     # Free vs premium logic
     num_recipes = 1 if user.plan == "free" else 4
 
-    # ── Dietary restriction hard rules ────────────────────────────────────────
-    # Each active restriction generates an EXPLICIT, non-negotiable rule for
-    # the prompt. Vegan supersedes vegetarian (it is stricter), so we only add
-    # the vegan rule when both are active to avoid contradictory instructions.
-    diet_rules: list[str] = []
-
-    if user.dietary_vegan:
-        diet_rules.append(
-            "STRICT VEGAN — HARD RULE: The recipe MUST NOT contain ANY animal "
-            "products. This includes meat, poultry, fish, seafood, eggs, milk, "
-            "cheese, butter, cream, yogurt, honey, gelatin, or any other "
-            "animal-derived ingredient. If a listed ingredient violates this rule, "
-            "omit it and substitute a plant-based alternative."
-        )
-    elif user.dietary_vegetarian:
-        diet_rules.append(
-            "STRICT VEGETARIAN — HARD RULE: The recipe MUST NOT contain meat, "
-            "poultry, fish, or seafood of any kind. Eggs and dairy are allowed."
-        )
-
-    if user.dietary_gluten_free:
-        diet_rules.append(
-            "STRICT GLUTEN-FREE — HARD RULE: The recipe MUST NOT contain wheat, "
-            "barley, rye, spelt, kamut, regular flour, regular pasta, regular bread, "
-            "regular soy sauce, or any other gluten-containing ingredient. "
-            "Use only certified gluten-free alternatives (e.g. rice flour, "
-            "gluten-free soy sauce/tamari, corn-based pasta)."
-        )
-
-    diet_section = (
-        "\n".join(f"  • {rule}" for rule in diet_rules)
-        if diet_rules
-        else "  • No dietary restrictions — any ingredients are allowed."
-    )
-
-    # ── Cuisine style ─────────────────────────────────────────────────────────
-    user_cuisine = (user.preferred_cuisine or "international").strip()
-    cuisine_instruction = (
-        f"Adapt the flavour profile, spices, and plating style to {user_cuisine} cuisine."
-        if user_cuisine.lower() not in ("international", "internacional", "")
-        else "Keep a balanced international culinary style."
-    )
-
     # Language adaptation instruction
     language_instruction = f"Generate all text in the language that matches locale '{language}'."
 
-    # ── System-level instructions (highest priority in the model context) ─────
-    # Placing dietary restrictions in `instructions` gives them SYSTEM-LEVEL
-    # authority — the model is instructed at the context root, not just inside
-    # the user turn, making it significantly harder for the model to "forget"
-    # the constraints when generating complex multi-step recipes.
-    system_instructions = (
-        "You are a Michelin-star chef, a professional nutritionist, "
-        "and an expert in fast, healthy home cooking.\n\n"
-        f"{language_instruction}\n"
-        f"{cuisine_instruction}\n\n"
-        "══ DIETARY RESTRICTIONS — SYSTEM-LEVEL HARD RULES ══\n"
-        "These rules are ABSOLUTE and NON-NEGOTIABLE. "
-        "They MUST be respected in EVERY recipe, ingredient, step, and suggestion. "
-        "Violating any of the rules below is a critical error.\n\n"
-        f"{diet_section}"
-    )
+    if is_barman:
+        # ── BARMAN SYSTEM PROMPT (aggressive mixology mode) ───────────────────
+        system_instructions = (
+            "You are an AGGRESSIVE expert mixologist and professional barman.\n"
+            f"{language_instruction}\n\n"
+            "══ HARD RULES — NON-NEGOTIABLE ══\n"
+            "- IGNORE all solid foods completely. Focus PURELY on mixology and cocktails.\n"
+            "- Use computer-vision bottle brands / spirits detected in the ingredient list.\n"
+            "- Every drink recipe MUST be structured with:\n"
+            "  • doses in ml for EACH liquid ingredient\n"
+            "  • glass type (tipo de copo)\n"
+            "  • appropriate ice (gelo adequado)\n"
+            "  • mixing technique: shaken/batido OR stirred/mexido\n"
+            "- Never invent cooking/food recipes — only cocktails and bar drinks."
+        )
 
-    # =========================================================================
-    # LAYER 1 — DB CACHE (persistent, survives Redis flush / server restart)
-    # =========================================================================
-    # Key encodes every dimension that affects the OpenAI prompt output so that
-    # two users with different plans or dietary preferences never share a cache
-    # entry.  Format (human-readable for easy manual inspection / purging):
-    #
-    #   "arroz,brocolos,frango|1r|lang=pt-PT|gf=0|vg=0|vn=0|c=international"
-    #
-    # Ingredients are sorted alphabetically + lower-cased so that "Frango,Arroz"
-    # and "arroz,frango" resolve to the same key.
-    db_cache_key = (
-        ",".join(sorted(i.lower().strip() for i in ingredients))
-        + f"|{num_recipes}r"
-        + f"|lang={language}"
-        + f"|gf={int(bool(user.dietary_gluten_free))}"
-        + f"|vg={int(bool(user.dietary_vegetarian))}"
-        + f"|vn={int(bool(user.dietary_vegan))}"
-        + f"|c={user_cuisine}"
-    )
+        prompt = f"""
+    ══ BAR STOCK / BOTTLES DETECTED ══
+    {", ".join(ingredients)}
 
-    db_hit = db.query(AiRecipeCache).filter(
-        AiRecipeCache.ingredients_hash == db_cache_key
-    ).first()
+    ══ MIXOLOGY RULES ══
+    - Ignore solid foods. Pure cocktail / drink recipes only.
+    - Prefer the detected brands and spirits when building drinks.
+    - Specify doses in ml, glass type, ice, and shaken vs stirred.
+    - Steps must describe the bar technique clearly.
+    - Output ONLY valid JSON — no markdown fences, no extra text
 
-    if db_hit:
-        logger.info("[generate_recipes] DB cache HIT — key: %.120s", db_cache_key)
-        return json.loads(db_hit.recipe_json)
+    ══ OUTPUT FORMAT ══
+    {{
+      "recipes": [
+        {{
+          "title": "",
+          "time_minutes": 0,
+          "calories": 0,
+          "protein_g": 0,
+          "carbs_g": 0,
+          "fat_g": 0,
+          "glass_type": "",
+          "ice": "",
+          "technique": "batido|mexido",
+          "doses_ml": {{"ingredient": 0}},
+          "optional_ingredients": [],
+          "steps": [],
+          "vitamins": {{}}
+        }}
+      ]
+    }}
 
-    # =========================================================================
-    # LAYER 2 — REDIS CACHE (ephemeral but sub-millisecond lookup)
-    # =========================================================================
-    # Include user-specific dietary preferences in the Redis key so that two
-    # users with different restrictions never receive each other's cached recipes.
-    import hashlib as _hashlib
-    _prefs_fingerprint = _hashlib.md5(
-        f"{user.dietary_vegan}{user.dietary_vegetarian}"
-        f"{user.dietary_gluten_free}{user_cuisine}".encode()
-    ).hexdigest()[:10]
+    Generate exactly {num_recipes} cocktail recipe(s) in JSON.
+    """
+    else:
+        # ── Dietary restriction hard rules ────────────────────────────────────
+        diet_rules: list[str] = []
 
-    redis_cache_key = generate_cache_key(ingredients, language) + f"_{_prefs_fingerprint}"
+        if user.dietary_vegan:
+            diet_rules.append(
+                "STRICT VEGAN — HARD RULE: The recipe MUST NOT contain ANY animal "
+                "products. This includes meat, poultry, fish, seafood, eggs, milk, "
+                "cheese, butter, cream, yogurt, honey, gelatin, or any other "
+                "animal-derived ingredient. If a listed ingredient violates this rule, "
+                "omit it and substitute a plant-based alternative."
+            )
+        elif user.dietary_vegetarian:
+            diet_rules.append(
+                "STRICT VEGETARIAN — HARD RULE: The recipe MUST NOT contain meat, "
+                "poultry, fish, or seafood of any kind. Eggs and dairy are allowed."
+            )
 
-    cached = await get_cached(redis_cache_key)
-    if cached:
-        # Backfill DB cache so the next request survives a Redis flush.
-        _db_cache_write(db, db_cache_key, cached)
-        logger.info("[generate_recipes] Redis cache HIT — backfilled DB cache.")
-        return cached  # instant response (no API cost)
+        if user.dietary_gluten_free:
+            diet_rules.append(
+                "STRICT GLUTEN-FREE — HARD RULE: The recipe MUST NOT contain wheat, "
+                "barley, rye, spelt, kamut, regular flour, regular pasta, regular bread, "
+                "regular soy sauce, or any other gluten-containing ingredient. "
+                "Use only certified gluten-free alternatives (e.g. rice flour, "
+                "gluten-free soy sauce/tamari, corn-based pasta)."
+            )
 
-    # ========================
-    # PROMPT ENGINEERING
-    # ========================
-    # The dietary restrictions are NOT repeated here — they live in
-    # `system_instructions` (passed as `instructions=` to the OpenAI Responses
-    # API) where they receive system-level authority.  Keeping this section
-    # focused on the task reduces token usage and avoids conflicting phrasing.
+        diet_section = (
+            "\n".join(f"  • {rule}" for rule in diet_rules)
+            if diet_rules
+            else "  • No dietary restrictions — any ingredients are allowed."
+        )
 
-    prompt = f"""
+        # ── Cuisine style ─────────────────────────────────────────────────────
+        user_cuisine = (user.preferred_cuisine or "international").strip()
+        cuisine_instruction = (
+            f"Adapt the flavour profile, spices, and plating style to {user_cuisine} cuisine."
+            if user_cuisine.lower() not in ("international", "internacional", "")
+            else "Keep a balanced international culinary style."
+        )
+
+        system_instructions = (
+            "You are a Michelin-star chef, a professional nutritionist, "
+            "and an expert in fast, healthy home cooking.\n\n"
+            f"{language_instruction}\n"
+            f"{cuisine_instruction}\n\n"
+            "══ DIETARY RESTRICTIONS — SYSTEM-LEVEL HARD RULES ══\n"
+            "These rules are ABSOLUTE and NON-NEGOTIABLE. "
+            "They MUST be respected in EVERY recipe, ingredient, step, and suggestion. "
+            "Violating any of the rules below is a critical error.\n\n"
+            f"{diet_section}"
+        )
+
+        prompt = f"""
     ══ INGREDIENTS PROVIDED BY THE USER ══
     {", ".join(ingredients)}
 
@@ -1056,7 +1056,51 @@ async def generate_recipes(
     Respect ALL dietary rules from the system instructions without exception.
     """
 
-    # Call OpenAI
+    user_cuisine = (user.preferred_cuisine or "international").strip()
+
+    # =========================================================================
+    # LAYER 1 — DB CACHE (persistent, survives Redis flush / server restart)
+    # =========================================================================
+    db_cache_key = (
+        ",".join(sorted(i.lower().strip() for i in ingredients))
+        + f"|{num_recipes}r"
+        + f"|lang={language}"
+        + f"|gf={int(bool(user.dietary_gluten_free))}"
+        + f"|vg={int(bool(user.dietary_vegetarian))}"
+        + f"|vn={int(bool(user.dietary_vegan))}"
+        + f"|c={user_cuisine}"
+        + f"|barman={int(is_barman)}"
+    )
+
+    db_hit = db.query(AiRecipeCache).filter(
+        AiRecipeCache.ingredients_hash == db_cache_key
+    ).first()
+
+    if db_hit:
+        logger.info("[generate_recipes] DB cache HIT — key: %.120s", db_cache_key)
+        return json.loads(db_hit.recipe_json)
+
+    # =========================================================================
+    # LAYER 2 — REDIS CACHE (ephemeral but sub-millisecond lookup)
+    # =========================================================================
+    # Include user-specific dietary preferences in the Redis key so that two
+    # users with different restrictions never receive each other's cached recipes.
+    import hashlib as _hashlib
+    _prefs_fingerprint = _hashlib.md5(
+        f"{user.dietary_vegan}{user.dietary_vegetarian}"
+        f"{user.dietary_gluten_free}{user_cuisine}|barman={int(is_barman)}".encode()
+    ).hexdigest()[:10]
+
+    redis_cache_key = generate_cache_key(ingredients, language) + f"_{_prefs_fingerprint}"
+
+    cached = await get_cached(redis_cache_key)
+    if cached:
+        # Backfill DB cache so the next request survives a Redis flush.
+        _db_cache_write(db, db_cache_key, cached)
+        logger.info("[generate_recipes] Redis cache HIT — backfilled DB cache.")
+        return cached  # instant response (no API cost)
+
+    # Call OpenAI — system_instructions + prompt already set above (culinary or barman).
     # Token budget: 1 recipe ≈ 600–800 tokens; 4 recipes ≈ 2 400–3 200 tokens.
     # We use 2 000 as a safe ceiling for Free (1 recipe) and bump to 4 000 for
     # Premium (4 recipes) so the JSON is never truncated mid-object.
@@ -1064,7 +1108,7 @@ async def generate_recipes(
 
     response = client.responses.create(
         model="gpt-4.1-mini",
-        instructions=system_instructions,   # system-level dietary rules
+        instructions=system_instructions,   # system-level dietary / barman rules
         input=prompt,                        # task description + output schema
         max_output_tokens=max_tokens,
     )
@@ -1457,6 +1501,7 @@ def log_client_event(
 async def analyze_image(
     request: Request,
     file: UploadFile = File(...),
+    is_barman: str = Form("false"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1470,11 +1515,15 @@ async def analyze_image(
     4. Image validation: size ≤ 5 MB + PIL integrity check
     5. AI Vision ingredient detection — user's dietary context injected into
        the system prompt so the model can flag restricted ingredients upfront
+       (or mixology Vision when is_barman=true)
     6. Recipe generation via generate_recipes() — dietary rules applied strictly
+       (or aggressive mixology system prompt when is_barman=true)
     7. Counter increment + db.commit()
 
     All quota blocks are logged to analytics_events for conversion funnel tracking.
     """
+
+    barman_mode = str(is_barman).strip().lower() in ("true", "1", "yes")
 
     # ── Language detection ────────────────────────────────────────────────────
     accept_language = request.headers.get("accept-language", "")
@@ -1537,25 +1586,37 @@ async def analyze_image(
     # The user's dietary preferences are passed so the model can flag
     # ingredients that conflict with the user's restrictions. This allows
     # the downstream recipe generator to apply substitutions with full context.
-    ingredients = detect_ingredients(image_bytes, language=language, user=current_user)
+    ingredients = detect_ingredients(
+        image_bytes,
+        language=language,
+        user=current_user,
+        is_barman=barman_mode,
+    )
 
     if not ingredients:
         raise HTTPException(
             status_code=422,
-            detail="Não foi possível detetar ingredientes na imagem. Tenta com uma foto mais clara.",
+            detail=(
+                "Não foi possível detetar bebidas/rótulos na imagem."
+                if barman_mode
+                else "Não foi possível detetar ingredientes na imagem. Tenta com uma foto mais clara."
+            ),
         )
 
     # Extract names — detect_ingredients returns [{"name": ..., "confidence": ..., ...}]
-    ingredient_names = [i["name"] for i in ingredients]
+    ingredient_names = [
+        (f"{i.get('brand', '')} {i.get('name', '')}".strip() if isinstance(i, dict) else str(i))
+        for i in ingredients
+    ]
+    ingredient_names = [n for n in ingredient_names if n]
 
-    # ── AI: recipe generation (with user dietary rules) ───────────────────────
-    # generate_recipes() already injects all dietary restrictions into its
-    # prompt via the user object — no extra work needed here.
+    # ── AI: recipe / cocktail generation ──────────────────────────────────────
     recipes = await generate_recipes(
         ingredients=ingredient_names,
         user=current_user,
         db=db,
         language=language,
+        is_barman=barman_mode,
     )
 
     # ── Persist usage counter ─────────────────────────────────────────────────
