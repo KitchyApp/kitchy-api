@@ -743,6 +743,30 @@ def _parse_openai_json(response, context: str = "") -> object:
 # ========================
 
 
+def resolve_language(request: Request, language: str | None = None) -> str:
+    """
+    Resolve client language from an explicit `language` param or Accept-Language.
+    Returns a normalised code: pt | en | es (default pt).
+    """
+    raw = (language or "").strip()
+    if not raw:
+        raw = request.headers.get("accept-language") or request.headers.get("Accept-Language") or ""
+    return _normalize_lang_code(raw)
+
+
+def _normalize_lang_code(raw: str | None) -> str:
+    if not raw:
+        return "pt"
+    # First tag only; drop q-factor (e.g. "pt-PT,pt;q=0.9" → "pt-PT")
+    tag = raw.split(",")[0].split(";")[0].strip()
+    code = tag.replace("_", "-").split("-")[0].lower()
+    return code if code in ("pt", "en", "es") else "pt"
+
+
+def _language_full_name(code: str) -> str:
+    return {"pt": "Portuguese", "en": "English", "es": "Spanish"}.get(code, "Portuguese")
+
+
 def detect_ingredients(
     image_bytes: bytes,
     language: str = "pt",
@@ -910,8 +934,18 @@ async def generate_recipes(
     # Applies equally to Culinária and Barman — never bypassed by is_barman.
     num_recipes = 4 if (user.plan or "").strip().lower() == "premium" else 1
 
-    # Language adaptation instruction
-    language_instruction = f"Generate all text in the language that matches locale '{language}'."
+    # Normalise to pt|en|es so prompts and cache keys stay consistent.
+    language = _normalize_lang_code(language)
+    lang_name = _language_full_name(language)
+
+    # Explicit LANGUAGE RULE — title, steps and ingredients must match the phone locale.
+    language_instruction = (
+        f"LANGUAGE RULE — NON-NEGOTIABLE: Write EVERY user-facing string STRICTLY in "
+        f"{lang_name} (language code '{language}'). "
+        f"This includes the recipe title, every cooking/mixology step, all ingredient "
+        f"names, optional_ingredients, glass_type, ice, technique, and any other text "
+        f"fields. Do NOT mix languages. Do NOT use English unless language code is 'en'."
+    )
 
     if is_barman:
         # ── BARMAN SYSTEM PROMPT (aggressive mixology mode) ───────────────────
@@ -962,6 +996,7 @@ async def generate_recipes(
     }}
 
     Generate exactly {num_recipes} cocktail recipe(s) in JSON.
+    Reminder: title, steps, doses keys and all text MUST be in {lang_name} only.
     """
     else:
         # ── Dietary restriction hard rules ────────────────────────────────────
@@ -1054,6 +1089,7 @@ async def generate_recipes(
     }}
 
     Generate exactly {num_recipes} recipe(s) in JSON.
+    Reminder: title, steps, optional_ingredients and all text MUST be in {lang_name} only.
     Respect ALL dietary rules from the system instructions without exception.
     """
 
@@ -1503,6 +1539,7 @@ async def analyze_image(
     request: Request,
     file: UploadFile = File(...),
     is_barman: str = Form("false"),
+    language: str | None = Form(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1510,7 +1547,7 @@ async def analyze_image(
     Main endpoint for image-based recipe generation.
 
     Flow:
-    1. Language auto-detection from Accept-Language header
+    1. Language auto-detection from `language` form field or Accept-Language header
     2. Daily-counter reset when a new calendar day starts
     3. Quota enforcement (1 analysis/day free · 4/day premium)
     4. Image validation: size ≤ 5 MB + PIL integrity check
@@ -1526,9 +1563,8 @@ async def analyze_image(
 
     barman_mode = str(is_barman).strip().lower() in ("true", "1", "yes")
 
-    # ── Language detection ────────────────────────────────────────────────────
-    accept_language = request.headers.get("accept-language", "")
-    language = accept_language.split(",")[0] if accept_language else "pt-PT"
+    # ── Language detection (form param wins over Accept-Language) ─────────────
+    language = resolve_language(request, language)
 
     # Reattach user from DB before quota — single source of truth for plan/counter.
     current_user = db.merge(current_user)

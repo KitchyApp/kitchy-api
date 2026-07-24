@@ -7,9 +7,9 @@ POST /challenges/{challenge_id}/verify — check if a recipe satisfies a challen
 
 import logging
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -30,6 +30,113 @@ router = APIRouter()
 class VerifyRequest(BaseModel):
     """Ingredients that the user actually used in the generated recipe."""
     ingredients: List[str]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOCALISATION (pt / en / es) — display only; verify still uses DB slugs
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TITLE_I18N: dict[str, dict[str, str]] = {
+    "badge_tomato": {
+        "pt": "Rei do Tomate & Manjericão",
+        "en": "Tomato & Basil King",
+        "es": "Rey del Tomate y Albahaca",
+    },
+    "badge_chickpea": {
+        "pt": "Mestre das Leguminosas",
+        "en": "Legume Master",
+        "es": "Maestro de las Legumbres",
+    },
+    "badge_tuna": {
+        "pt": "Caçador de Atum",
+        "en": "Tuna Hunter",
+        "es": "Cazador de Atún",
+    },
+    "badge_lentil": {
+        "pt": "Herói das Lentilhas",
+        "en": "Lentil Hero",
+        "es": "Héroe de las Lentejas",
+    },
+    "badge_egg": {
+        "pt": "Rei dos Ovos",
+        "en": "Egg King",
+        "es": "Rey de los Huevos",
+    },
+    "badge_protein": {
+        "pt": "Monstro do Ginásio",
+        "en": "Gym Monster",
+        "es": "Monstruo del Gimnasio",
+    },
+    "badge_gourmet": {
+        "pt": "Chef de Elite",
+        "en": "Elite Chef",
+        "es": "Chef de Élite",
+    },
+    "badge_rosemary": {
+        "pt": "Lombo & Alecrim",
+        "en": "Pork & Rosemary",
+        "es": "Lomo y Romero",
+    },
+    "badge_mediterranean": {
+        "pt": "Rei do Mediterrâneo",
+        "en": "Mediterranean King",
+        "es": "Rey del Mediterráneo",
+    },
+    "badge_mushroom": {
+        "pt": "O Cogumelo Místico",
+        "en": "The Mystic Mushroom",
+        "es": "El Champiñón Místico",
+    },
+}
+
+_INGREDIENT_I18N: dict[str, dict[str, str]] = {
+    "tomate": {"pt": "tomate", "en": "tomato", "es": "tomate"},
+    "manjericao": {"pt": "manjericão", "en": "basil", "es": "albahaca"},
+    "grao-de-bico": {"pt": "grão-de-bico", "en": "chickpea", "es": "garbanzo"},
+    "espinafres": {"pt": "espinafres", "en": "spinach", "es": "espinacas"},
+    "atum": {"pt": "atum", "en": "tuna", "es": "atún"},
+    "lentilhas": {"pt": "lentilhas", "en": "lentils", "es": "lentejas"},
+    "cenoura": {"pt": "cenoura", "en": "carrot", "es": "zanahoria"},
+    "ovos": {"pt": "ovos", "en": "eggs", "es": "huevos"},
+    "frango": {"pt": "frango", "en": "chicken", "es": "pollo"},
+    "salmao": {"pt": "salmão", "en": "salmon", "es": "salmón"},
+    "abacate": {"pt": "abacate", "en": "avocado", "es": "aguacate"},
+    "lombo de porco": {"pt": "lombo de porco", "en": "pork loin", "es": "lomo de cerdo"},
+    "alecrim": {"pt": "alecrim", "en": "rosemary", "es": "romero"},
+    "bacalhau": {"pt": "bacalhau", "en": "cod", "es": "bacalao"},
+    "azeitonas": {"pt": "azeitonas", "en": "olives", "es": "aceitunas"},
+    "cogumelos": {"pt": "cogumelos", "en": "mushrooms", "es": "champiñones"},
+    "carne picada": {"pt": "carne picada", "en": "minced meat", "es": "carne picada"},
+}
+
+
+def _resolve_lang(request: Request, language: Optional[str] = None) -> str:
+    raw = (language or "").strip()
+    if not raw:
+        raw = request.headers.get("accept-language") or request.headers.get("Accept-Language") or ""
+    if not raw:
+        return "pt"
+    tag = raw.split(",")[0].split(";")[0].strip()
+    code = tag.replace("_", "-").split("-")[0].lower()
+    return code if code in ("pt", "en", "es") else "pt"
+
+
+def _translate_title(badge_code: str, fallback: str, lang: str) -> str:
+    entry = _TITLE_I18N.get(badge_code)
+    if not entry:
+        return fallback
+    return entry.get(lang) or entry.get("pt") or fallback
+
+
+def _translate_ingredients(required_csv: str, lang: str) -> str:
+    parts = []
+    for token in required_csv.split(","):
+        key = token.strip().lower()
+        if not key:
+            continue
+        mapped = _INGREDIENT_I18N.get(key, {})
+        parts.append(mapped.get(lang) or mapped.get("pt") or token.strip())
+    return ",".join(parts)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,16 +182,22 @@ def _ingredients_satisfied(required_csv: str, provided: List[str]) -> tuple[bool
 
 @router.get("")
 def list_challenges(
+    request: Request,
+    language: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
     Return all challenges with the authenticated user's progress.
 
+    Titles and required_ingredients are localised from Accept-Language
+    (or the `language` query param) before the JSON response is built.
+
     For Free users (`plan != "premium"`), premium-only challenges are
     returned with `is_locked: true` and `badge_code` redacted so the
     frontend can render a paywall overlay without a separate request.
     """
+    lang = _resolve_lang(request, language)
     is_premium = current_user.plan == "premium"
 
     challenges = (
@@ -109,8 +222,8 @@ def list_challenges(
 
         result.append({
             "id":                   ch.id,
-            "title":                ch.title,
-            "required_ingredients": ch.required_ingredients,
+            "title":                _translate_title(ch.badge_code, ch.title, lang),
+            "required_ingredients": _translate_ingredients(ch.required_ingredients, lang),
             "is_premium_only":      ch.is_premium_only,
             "is_locked":            is_locked,
             # Hide the badge for locked challenges so it cannot be scraped.
