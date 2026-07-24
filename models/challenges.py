@@ -49,6 +49,14 @@ class ChefChallenge(Base):
         server_default="0",
     )
 
+    # Challenge type for the Flutter tabs: "culinary" | "barman".
+    category: Mapped[str] = mapped_column(
+        String,
+        default="culinary",
+        server_default="culinary",
+        nullable=False,
+    )
+
     # Short code / emoji for the badge awarded on completion.
     badge_code: Mapped[str] = mapped_column(
         String,

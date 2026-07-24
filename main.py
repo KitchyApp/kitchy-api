@@ -77,7 +77,12 @@ from slowapi.middleware import SlowAPIMiddleware
 from pydantic import BaseModel, EmailStr, constr
 from models import User, Purchase, AnalyticsEvent, AiRecipeCache, ChefChallenge, UserChallengeProgress  # noqa: F401 — all model classes must be imported so Base.metadata includes their tables in create_all()
 from routers import auth, billing, challenges
-from challenges_pool import FREE_CHALLENGES, PREMIUM_CHALLENGES
+from challenges_pool import (
+    FREE_BARMAN_CHALLENGES,
+    FREE_CULINARY_CHALLENGES,
+    PREMIUM_BARMAN_CHALLENGES,
+    PREMIUM_CULINARY_CHALLENGES,
+)
 from core.security import hash_password
 from dependencies.auth import get_current_user
 
@@ -162,9 +167,11 @@ app.include_router(challenges.router, prefix="/challenges", tags=["Challenges"])
 # WEEKLY CHALLENGE ROTATION
 # ========================
 
-# Number of challenges inserted per rotation run.
-_FREE_PER_WEEK = 1
-_PREMIUM_PER_WEEK = 2
+# Number of challenges inserted per rotation run (per category).
+_FREE_CULINARY_PER_WEEK = 1
+_PREMIUM_CULINARY_PER_WEEK = 2
+_FREE_BARMAN_PER_WEEK = 1
+_PREMIUM_BARMAN_PER_WEEK = 1
 
 
 def _current_iso_week() -> tuple[int, int]:
@@ -200,13 +207,9 @@ def _run_rotation(db: Session) -> None:
     """
     Weekly rotation:
       1. Mark all currently-active challenges as inactive.
-      2. Sample _FREE_PER_WEEK + _PREMIUM_PER_WEEK from the pool,
+      2. Sample culinary + barman challenges from their pools,
          avoiding badge codes that were active in the previous cycle.
       3. Insert the new selection tagged with the current ISO week.
-
-    Uses random.sample() so consecutive weeks are very unlikely to repeat
-    the same challenges (pool size > selection size guarantees this for the
-    default pool of 5+5).
     """
     year, week = _current_iso_week()
 
@@ -225,6 +228,8 @@ def _run_rotation(db: Session) -> None:
     # ── Select new challenges, preferring ones not used last week
     def _prefer_fresh(pool: list[dict], n: int) -> list[dict]:
         """Sample n items from pool, giving priority to unseen badge codes."""
+        if n <= 0 or not pool:
+            return []
         fresh = [c for c in pool if c["badge_code"] not in previous_badges]
         if len(fresh) >= n:
             return random.sample(fresh, n)
@@ -232,8 +237,10 @@ def _run_rotation(db: Session) -> None:
         return random.sample(pool, min(n, len(pool)))
 
     selected: list[dict] = (
-        _prefer_fresh(FREE_CHALLENGES, _FREE_PER_WEEK)
-        + _prefer_fresh(PREMIUM_CHALLENGES, _PREMIUM_PER_WEEK)
+        _prefer_fresh(FREE_CULINARY_CHALLENGES, _FREE_CULINARY_PER_WEEK)
+        + _prefer_fresh(PREMIUM_CULINARY_CHALLENGES, _PREMIUM_CULINARY_PER_WEEK)
+        + _prefer_fresh(FREE_BARMAN_CHALLENGES, _FREE_BARMAN_PER_WEEK)
+        + _prefer_fresh(PREMIUM_BARMAN_CHALLENGES, _PREMIUM_BARMAN_PER_WEEK)
     )
 
     for tmpl in selected:
@@ -242,6 +249,7 @@ def _run_rotation(db: Session) -> None:
             required_ingredients=tmpl["required_ingredients"],
             is_premium_only=tmpl["is_premium_only"],
             badge_code=tmpl["badge_code"],
+            category=tmpl.get("category", "culinary"),
             is_active=1,
             week_number=week,
             week_year=year,
@@ -251,7 +259,7 @@ def _run_rotation(db: Session) -> None:
     logger.info(
         "[rotation] Week %d/%d activated: %s",
         week, year,
-        [c["title"] for c in selected],
+        [f"{c['category']}:{c['title']}" for c in selected],
     )
 
 
@@ -263,6 +271,9 @@ def _startup_rotation() -> None:
     On every server start, check whether the current ISO week already has
     active challenges.  If not (first boot or Monday after a cold restart),
     run the rotation immediately so the API always returns fresh data.
+
+    Also backfills barman challenges when this week only has culinary rows
+    (legacy rotations before the category column existed).
     """
     db = SessionLocal()
     try:
@@ -271,10 +282,62 @@ def _startup_rotation() -> None:
             _run_rotation(db)
         else:
             logger.debug("[startup] Active challenges found for this week — skipping rotation.")
+            _backfill_barman_if_missing(db)
     except Exception as exc:
         logger.error("[startup] Startup rotation failed: %s", exc)
     finally:
         db.close()
+
+
+def _backfill_barman_if_missing(db: Session) -> None:
+    """Insert barman challenges for the current week when none are active yet."""
+    year, week = _current_iso_week()
+    has_barman = (
+        db.query(ChefChallenge)
+        .filter(
+            ChefChallenge.is_active == 1,
+            ChefChallenge.week_year == year,
+            ChefChallenge.week_number == week,
+            ChefChallenge.category == "barman",
+        )
+        .count()
+    )
+    if has_barman > 0:
+        return
+
+    active_badges = {
+        row.badge_code
+        for row in db.query(ChefChallenge.badge_code)
+        .filter(ChefChallenge.is_active == 1)
+        .all()
+    }
+
+    def _pick(pool: list[dict], n: int) -> list[dict]:
+        fresh = [c for c in pool if c["badge_code"] not in active_badges]
+        src = fresh if len(fresh) >= n else pool
+        return random.sample(src, min(n, len(src))) if src else []
+
+    selected = (
+        _pick(FREE_BARMAN_CHALLENGES, _FREE_BARMAN_PER_WEEK)
+        + _pick(PREMIUM_BARMAN_CHALLENGES, _PREMIUM_BARMAN_PER_WEEK)
+    )
+    for tmpl in selected:
+        db.add(ChefChallenge(
+            title=tmpl["title"],
+            required_ingredients=tmpl["required_ingredients"],
+            is_premium_only=tmpl["is_premium_only"],
+            badge_code=tmpl["badge_code"],
+            category="barman",
+            is_active=1,
+            week_number=week,
+            week_year=year,
+        ))
+    if selected:
+        db.commit()
+        logger.info(
+            "[startup] Backfilled %d barman challenge(s) for week %d/%d.",
+            len(selected), week, year,
+        )
 
 
 # ── Background async worker — fires rotation every Monday 00:00 UTC ──────────

@@ -135,6 +135,8 @@ def run_column_migrations() -> None:
             ("is_active",            "INTEGER DEFAULT 1"),
             ("week_number",          "INTEGER"),
             ("week_year",            "INTEGER"),
+            # culinary | barman — drives the Flutter Challenges TabBar.
+            ("category",             "VARCHAR DEFAULT 'culinary'"),
         ],
 
         # ── user_challenge_progress (models/challenges.py) ────────────────────

@@ -87,6 +87,36 @@ _TITLE_I18N: dict[str, dict[str, str]] = {
         "en": "The Mystic Mushroom",
         "es": "El Champiñón Místico",
     },
+    "badge_gin_tonic": {
+        "pt": "Mestre do Gin Tónico",
+        "en": "Gin & Tonic Master",
+        "es": "Maestro del Gin Tonic",
+    },
+    "badge_mojito": {
+        "pt": "Rei do Mojito",
+        "en": "Mojito King",
+        "es": "Rey del Mojito",
+    },
+    "badge_citrus": {
+        "pt": "Caçador de Citrus",
+        "en": "Citrus Hunter",
+        "es": "Cazador de Cítricos",
+    },
+    "badge_negroni": {
+        "pt": "Negroni Clássico",
+        "en": "Classic Negroni",
+        "es": "Negroni Clásico",
+    },
+    "badge_whisky": {
+        "pt": "Bartender de Elite",
+        "en": "Elite Bartender",
+        "es": "Bartender de Élite",
+    },
+    "badge_margarita": {
+        "pt": "Mestre da Margarita",
+        "en": "Margarita Master",
+        "es": "Maestro de la Margarita",
+    },
 }
 
 _INGREDIENT_I18N: dict[str, dict[str, str]] = {
@@ -107,6 +137,17 @@ _INGREDIENT_I18N: dict[str, dict[str, str]] = {
     "azeitonas": {"pt": "azeitonas", "en": "olives", "es": "aceitunas"},
     "cogumelos": {"pt": "cogumelos", "en": "mushrooms", "es": "champiñones"},
     "carne picada": {"pt": "carne picada", "en": "minced meat", "es": "carne picada"},
+    "gin": {"pt": "gin", "en": "gin", "es": "ginebra"},
+    "tonic": {"pt": "tónica", "en": "tonic", "es": "tónica"},
+    "rum": {"pt": "rum", "en": "rum", "es": "ron"},
+    "hortela": {"pt": "hortelã", "en": "mint", "es": "menta"},
+    "limao": {"pt": "limão", "en": "lemon", "es": "limón"},
+    "vodka": {"pt": "vodka", "en": "vodka", "es": "vodka"},
+    "campari": {"pt": "campari", "en": "campari", "es": "campari"},
+    "vermut": {"pt": "vermut", "en": "vermouth", "es": "vermut"},
+    "whisky": {"pt": "whisky", "en": "whisky", "es": "whisky"},
+    "bitters": {"pt": "bitters", "en": "bitters", "es": "amargos"},
+    "tequila": {"pt": "tequila", "en": "tequila", "es": "tequila"},
 }
 
 
@@ -188,14 +229,19 @@ def list_challenges(
     db: Session = Depends(get_db),
 ):
     """
-    Return all challenges with the authenticated user's progress.
+    Return active challenges grouped for the Flutter Challenges TabBar.
+
+    Response shape:
+      {
+        "culinary": [ ...challenge cards... ],
+        "barman":   [ ...challenge cards... ]
+      }
 
     Titles and required_ingredients are localised from Accept-Language
-    (or the `language` query param) before the JSON response is built.
+    (or the `language` query param) before the JSON is built.
 
     For Free users (`plan != "premium"`), premium-only challenges are
-    returned with `is_locked: true` and `badge_code` redacted so the
-    frontend can render a paywall overlay without a separate request.
+    returned with `is_locked: true` and `badge_code` redacted.
     """
     lang = _resolve_lang(request, language)
     is_premium = current_user.plan == "premium"
@@ -203,7 +249,11 @@ def list_challenges(
     challenges = (
         db.query(ChefChallenge)
         .filter(ChefChallenge.is_active == 1)
-        .order_by(ChefChallenge.is_premium_only.asc(), ChefChallenge.id.asc())
+        .order_by(
+            ChefChallenge.category.asc(),
+            ChefChallenge.is_premium_only.asc(),
+            ChefChallenge.id.asc(),
+        )
         .all()
     )
 
@@ -215,15 +265,22 @@ def list_challenges(
         .all()
     }
 
-    result = []
+    culinary: list[dict] = []
+    barman: list[dict] = []
+
     for ch in challenges:
         is_locked = ch.is_premium_only and not is_premium
         progress = progress_map.get(ch.id)
+        category = (getattr(ch, "category", None) or "culinary").strip().lower()
+        if category not in ("culinary", "barman"):
+            category = "culinary"
 
-        result.append({
+        card = {
             "id":                   ch.id,
             "title":                _translate_title(ch.badge_code, ch.title, lang),
             "required_ingredients": _translate_ingredients(ch.required_ingredients, lang),
+            "category":             category,
+            "is_barman":            category == "barman",
             "is_premium_only":      ch.is_premium_only,
             "is_locked":            is_locked,
             # Hide the badge for locked challenges so it cannot be scraped.
@@ -234,12 +291,19 @@ def list_challenges(
                 if (progress and progress.completed_at)
                 else None
             ),
-            # Rotation metadata — lets the frontend show "Semana X" if desired.
             "week_number": ch.week_number,
             "week_year":   ch.week_year,
-        })
+        }
 
-    return result
+        if category == "barman":
+            barman.append(card)
+        else:
+            culinary.append(card)
+
+    return {
+        "culinary": culinary,
+        "barman": barman,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
