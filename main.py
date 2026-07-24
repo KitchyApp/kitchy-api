@@ -906,8 +906,9 @@ async def generate_recipes(
     # Normalize ingredient names (important for consistency + cache hits)
     ingredients = normalize_ingredients(ingredients)
 
-    # Free vs premium logic
-    num_recipes = 1 if user.plan == "free" else 4
+    # Free vs premium: ONLY explicit "premium" earns 4 recipes.
+    # Applies equally to Culinária and Barman — never bypassed by is_barman.
+    num_recipes = 4 if (user.plan or "").strip().lower() == "premium" else 1
 
     # Language adaptation instruction
     language_instruction = f"Generate all text in the language that matches locale '{language}'."
@@ -1529,21 +1530,21 @@ async def analyze_image(
     accept_language = request.headers.get("accept-language", "")
     language = accept_language.split(",")[0] if accept_language else "pt-PT"
 
+    # Reattach user from DB before quota — single source of truth for plan/counter.
+    current_user = db.merge(current_user)
+    db.refresh(current_user)
+
     # ── Daily counter reset (must happen before quota check) ──────────────────
-    # Resetting in-memory before the quota check guarantees the first request
-    # of a new day always succeeds, regardless of yesterday's counter value.
-    # We commit the reset together with the final counter increment at the end,
-    # avoiding an extra round-trip for every non-blocked request.
     hoje = date.today()
     if current_user.last_analysis_date != hoje:
         current_user.analyses_today = 0
         current_user.last_analysis_date = hoje
 
-    # ── Quota enforcement ─────────────────────────────────────────────────────
-    # Only an explicit "premium" plan value earns the higher limit.
-    # Any other value — "free", None, an unexpected string, or an expired plan
-    # still lingering in the DB — falls back to the free-tier limit of 1.
-    limit = 4 if current_user.plan == "premium" else 1
+    # ── Quota enforcement (UNIVERSAL — Culinária AND Barman) ──────────────────
+    # Free = 1 analysis/day · Premium = 4/day.
+    # is_barman MUST NOT bypass, reset, or alter this check.
+    plan = (current_user.plan or "free").strip().lower()
+    limit = 4 if plan == "premium" else 1
 
     if current_user.analyses_today >= limit:
         log_analytics_event(
@@ -1552,7 +1553,8 @@ async def analyze_image(
             user_id=current_user.id,
             metadata={
                 "endpoint": "analyze_image",
-                "plan": current_user.plan or "free",
+                "plan": plan,
+                "is_barman": barman_mode,
                 "analyses_today": current_user.analyses_today,
                 "limit": limit,
             },
@@ -1561,7 +1563,7 @@ async def analyze_image(
             status_code=403,
             detail=(
                 f"Limite diário de {limit} análise(s) de imagem atingido para o teu plano "
-                f"'{current_user.plan or 'free'}'. "
+                f"'{plan}'. "
                 "Faz upgrade para Premium para teres 4 análises por dia!"
             ),
         )
@@ -1579,13 +1581,7 @@ async def analyze_image(
     except Exception:
         raise HTTPException(400, "Ficheiro inválido ou corrompido. Envia uma imagem JPEG/PNG.")
 
-    current_user = db.query(current_user.__class__).filter(current_user.__class__.id == current_user.id).first()
-    db.refresh(current_user)
-
     # ── AI: ingredient detection (Vision) ────────────────────────────────────
-    # The user's dietary preferences are passed so the model can flag
-    # ingredients that conflict with the user's restrictions. This allows
-    # the downstream recipe generator to apply substitutions with full context.
     ingredients = detect_ingredients(
         image_bytes,
         language=language,
