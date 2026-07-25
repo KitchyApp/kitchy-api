@@ -502,6 +502,8 @@ Index("idx_purchase_token_hash", Purchase.purchase_token_hash)
 
 class IngredientsRequest(BaseModel):
     ingredients: str
+    # Titles to avoid when asking for an alternative suggestion (Premium).
+    exclude_titles: List[str] = []
 
 
 class AnalyticsLogRequest(BaseModel):
@@ -974,9 +976,13 @@ async def generate_recipes(
         db: Session,
         language: str = "en-US",
         is_barman: bool = False,
+        exclude_titles: List[str] | None = None,
 ):
     """
     Generates recipes using AI based on ingredients and user preferences.
+
+    Always returns exactly 1 recipe. Premium users request alternatives via
+    a separate call with exclude_titles so the model avoids repeating titles.
 
     Cache hierarchy (fastest → slowest):
       1. DB cache  (AiRecipeCache) — persistent across restarts, checked first.
@@ -993,9 +999,17 @@ async def generate_recipes(
     # Normalize ingredient names (important for consistency + cache hits)
     ingredients = normalize_ingredients(ingredients)
 
-    # Free vs premium: ONLY explicit "premium" earns 4 recipes.
-    # Applies equally to Culinária and Barman — never bypassed by is_barman.
-    num_recipes = 4 if (user.plan or "").strip().lower() == "premium" else 1
+    # One recipe per request — Premium alternatives are separate calls.
+    num_recipes = 1
+    excluded = [t.strip() for t in (exclude_titles or []) if t and str(t).strip()]
+    exclude_rule = (
+        "- ALTERNATIVE RECIPE DIRECTIVE — NON-NEGOTIABLE: Using the SAME ingredients, "
+        "create a completely DIFFERENT recipe from all of these already-suggested titles: "
+        f"{', '.join(excluded)}. "
+        "Change the dish concept, technique and title — do not reuse or lightly rename them.\n"
+        if excluded
+        else ""
+    )
 
     # Normalise to pt|en|es so prompts and cache keys stay consistent.
     language = _normalize_lang_code(language)
@@ -1035,7 +1049,7 @@ async def generate_recipes(
     - Prefer the detected brands and spirits when building drinks.
     - Specify doses in ml, glass type, ice, and shaken vs stirred.
     - Steps must describe the bar technique clearly.
-    - Output ONLY valid JSON — no markdown fences, no extra text
+    {exclude_rule}- Output ONLY valid JSON — no markdown fences, no extra text
 
     ══ OUTPUT FORMAT ══
     {{
@@ -1127,7 +1141,7 @@ async def generate_recipes(
     - Include preparation steps (washing, chopping, marinating, etc.)
     - Suggest optional extra ingredients that would enhance the recipe
     - Provide accurate nutritional values per serving
-    - Output ONLY valid JSON — no markdown fences, no extra text
+    {exclude_rule}- Output ONLY valid JSON — no markdown fences, no extra text
 
     ══ OUTPUT FORMAT ══
     {{
@@ -1170,6 +1184,7 @@ async def generate_recipes(
         + f"|vn={int(bool(user.dietary_vegan))}"
         + f"|c={user_cuisine}"
         + f"|barman={int(is_barman)}"
+        + (f"|ex={','.join(sorted(t.lower() for t in excluded))}" if excluded else "")
     )
 
     db_hit = db.query(AiRecipeCache).filter(
@@ -1188,7 +1203,8 @@ async def generate_recipes(
     import hashlib as _hashlib
     _prefs_fingerprint = _hashlib.md5(
         f"{user.dietary_vegan}{user.dietary_vegetarian}"
-        f"{user.dietary_gluten_free}{user_cuisine}|barman={int(is_barman)}".encode()
+        f"{user.dietary_gluten_free}{user_cuisine}|barman={int(is_barman)}"
+        f"|ex={','.join(sorted(t.lower() for t in excluded))}".encode()
     ).hexdigest()[:10]
 
     redis_cache_key = generate_cache_key(ingredients, language) + f"_{_prefs_fingerprint}"
@@ -1348,6 +1364,7 @@ async def generate_recipes_from_text(
         user=current_user,
         db=db,
         language=language,
+        exclude_titles=list(data.exclude_titles or []),
     )
 
     # Increment usage counter
@@ -1603,6 +1620,8 @@ async def analyze_image(
     file: UploadFile = File(...),
     is_barman: str = Form("false"),
     language: str | None = Form(None),
+    exclude_recipes: str = Form("[]"),
+    exclude_titles: str = Form("[]"),  # legacy alias — prefer exclude_recipes
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1614,12 +1633,12 @@ async def analyze_image(
     2. Daily-counter reset when a new calendar day starts
     3. Quota enforcement (1 analysis/day free · 4/day premium)
     4. Image validation: size ≤ 5 MB + PIL integrity check
-    5. AI Vision ingredient detection — user's dietary context injected into
-       the system prompt so the model can flag restricted ingredients upfront
-       (or mixology Vision when is_barman=true)
-    6. Recipe generation via generate_recipes() — dietary rules applied strictly
-       (or aggressive mixology system prompt when is_barman=true)
-    7. Counter increment + db.commit()
+    5. AI Vision ingredient detection
+    6. Recipe generation — ALWAYS exactly 1 recipe
+       Optional form field `exclude_recipes` (JSON list of titles) steers the
+       model to invent a totally different recipe for the same ingredients.
+    7. Increment analyses_today by exactly +1 (every call, including Premium
+       alternative clicks) then db.commit()
 
     All quota blocks are logged to analytics_events for conversion funnel tracking.
     """
@@ -1641,6 +1660,7 @@ async def analyze_image(
 
     # ── Quota enforcement (UNIVERSAL — Culinária AND Barman) ──────────────────
     # Free = 1 analysis/day · Premium = 4/day.
+    # Each successful call (including Premium "alternative") counts as +1.
     # is_barman MUST NOT bypass, reset, or alter this check.
     plan = (current_user.plan or "free").strip().lower()
     limit = 4 if plan == "premium" else 1
@@ -1705,19 +1725,36 @@ async def analyze_image(
     ]
     ingredient_names = [n for n in ingredient_names if n]
 
-    # ── AI: recipe / cocktail generation ──────────────────────────────────────
+    # Optional exclude_recipes: JSON list of titles already shown to the user.
+    # Falls back to legacy exclude_titles so older clients keep working.
+    def _parse_exclude(raw: str) -> list[str]:
+        if not raw or not str(raw).strip():
+            return []
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return []
+        if not isinstance(parsed, list):
+            return []
+        return [str(t).strip() for t in parsed if str(t).strip()]
+
+    excluded = _parse_exclude(exclude_recipes) or _parse_exclude(exclude_titles)
+
+    # ── AI: exactly 1 recipe / cocktail ───────────────────────────────────────
     recipes = await generate_recipes(
         ingredients=ingredient_names,
         user=current_user,
         db=db,
         language=language,
         is_barman=barman_mode,
+        exclude_titles=excluded,
     )
+    # Defence-in-depth: never return more than one recipe from this endpoint.
+    recipes = (recipes or [])[:1]
 
-    # ── Persist usage counter ─────────────────────────────────────────────────
-    # Single commit: captures daily reset (if it happened) + increment together.
+    # ── Persist usage counter (+1 per call, Premium alternatives included) ───
     current_user = db.merge(current_user)
-    current_user.analyses_today += 1
+    current_user.analyses_today = int(current_user.analyses_today or 0) + 1
     db.commit()
 
     return {
