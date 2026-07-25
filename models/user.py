@@ -101,3 +101,13 @@ class User(Base):
         default=False,
         server_default="0",
     )
+
+    @property
+    def is_premium(self) -> bool:
+        """True when the user has an active Premium plan (not expired)."""
+        plan = (self.plan or "").strip().lower()
+        if plan != "premium":
+            return False
+        if self.plan_expiry is not None and self.plan_expiry < datetime.utcnow():
+            return False
+        return True

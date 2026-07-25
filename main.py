@@ -1320,12 +1320,11 @@ async def generate_recipes_from_text(
         current_user.analyses_today = 0
         current_user.last_analysis_date = hoje
 
-    # Quota: only an explicit "premium" plan value earns the higher limit.
-    # Any other value — "free", None, an unexpected string, an expired plan
-    # still in the DB — falls back to the free-tier limit of 1.
-    limit = 4 if current_user.plan == "premium" else 1
+    # Quota: Premium (is_premium) → 4/day; Free → 1/day.
+    # .strip().lower() avoids false free-tier when plan has odd casing/spaces.
+    limit = 4 if current_user.is_premium else 1
 
-    if current_user.analyses_today >= limit:
+    if int(current_user.analyses_today or 0) >= limit:
         log_analytics_event(
             db,
             event_name="limit_blocked_403",
@@ -1659,13 +1658,15 @@ async def analyze_image(
         current_user.last_analysis_date = hoje
 
     # ── Quota enforcement (UNIVERSAL — Culinária AND Barman) ──────────────────
-    # Free = 1 analysis/day · Premium = 4/day.
-    # Each successful call (including Premium "alternative") counts as +1.
+    # Free = 1/day · Premium (current_user.is_premium) = 4/day.
+    # Each successful call (including Premium "alternative" / exclude_recipes)
+    # increments analyses_today by exactly +1.
     # is_barman MUST NOT bypass, reset, or alter this check.
-    plan = (current_user.plan or "free").strip().lower()
-    limit = 4 if plan == "premium" else 1
+    is_premium = bool(current_user.is_premium)
+    limit = 4 if is_premium else 1
+    plan = "premium" if is_premium else ((current_user.plan or "free").strip().lower() or "free")
 
-    if current_user.analyses_today >= limit:
+    if int(current_user.analyses_today or 0) >= limit:
         log_analytics_event(
             db,
             event_name="limit_blocked_403",
@@ -1673,8 +1674,9 @@ async def analyze_image(
             metadata={
                 "endpoint": "analyze_image",
                 "plan": plan,
+                "is_premium": is_premium,
                 "is_barman": barman_mode,
-                "analyses_today": current_user.analyses_today,
+                "analyses_today": int(current_user.analyses_today or 0),
                 "limit": limit,
             },
         )
