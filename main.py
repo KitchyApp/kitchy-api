@@ -665,6 +665,24 @@ def verify_purchase(
     return {"status": "premium_activated", "expires_at": expires_at}
 
 
+@app.delete("/billing/cancel")
+def cancel_billing(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Cancel Premium for the authenticated user.
+
+    Reattaches the JWT user to this session, downgrades plan to free,
+    and commits. Returns 200 OK.
+    """
+    current_user = db.merge(current_user)
+    current_user.plan = "free"
+    current_user.plan_expiry = None
+    db.commit()
+    return {"status": "cancelled"}
+
+
 @app.post("/auth/subscribe")
 def subscribe(
     current_user: User = Depends(get_current_user),
