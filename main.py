@@ -662,7 +662,7 @@ def verify_purchase(
     current_user.plan_expiry = expires_at
     db.commit()
 
-    return {"status": "premium_activated", "expires_at": expires_at}
+    return {"status": "success", "message": "Premium activated"}
 
 
 @app.delete("/billing/cancel")

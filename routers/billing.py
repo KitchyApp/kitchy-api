@@ -69,9 +69,5 @@ def verify_purchase(
         },
     )
 
-    return {
-        "status": "premium_activated",
-        "expires_in_days": result["expires_in_days"],
-        "sandbox": result.get("sandbox", False),
-    }
+    return {"status": "success", "message": "Premium activated"}
 
