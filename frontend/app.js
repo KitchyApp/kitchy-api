@@ -1,3 +1,9 @@
+// Smart Kitchen demo frontend — image upload, ingredient detection, and recipe display.
+// Talks to the FastAPI backend at localhost:8000. UI strings are Portuguese (pt).
+
+// Upload the selected image to POST /analyze-image/, then render detected
+// ingredients and suggested recipes. On rate-limit or network failure, falls
+// back to cached or static placeholder data so the page stays usable.
 async function sendImage() {
     const fileInput = document.getElementById("imageInput");
     const status = document.getElementById("status");
@@ -27,7 +33,7 @@ async function sendImage() {
 
         const data = await response.json();
 
-        // ⚠️ RATE LIMIT → fallback
+        // Rate limit hit — show static fallback recipes instead of an error.
         if (data.error && data.error.toLowerCase().includes("rate")) {
             status.innerText = "⚠️ Muitas análises seguidas. A mostrar sugestões.";
 
@@ -38,7 +44,7 @@ async function sendImage() {
             return;
         }
 
-        // ❌ outro erro
+        // Any other API error — surface details to the user.
         if (data.error) {
             status.innerText = "❌ " + (data.details || data.error);
             return;
@@ -50,7 +56,7 @@ async function sendImage() {
         localStorage.setItem("lastResult", JSON.stringify(data));
 
     } catch (err) {
-        // 🔄 fallback se houver erro total
+        // Network or parse failure — restore the last successful result if available.
         const cached = localStorage.getItem("lastResult");
         if (cached) {
             status.innerText = "⚠️ Offline. A mostrar último resultado.";
@@ -61,8 +67,10 @@ async function sendImage() {
     }
 }
 
-/* -------- helpers -------- */
+// -------- DOM rendering helpers --------
 
+// Populate the ingredients list and recipe cards from an API or fallback payload.
+// Expects { ingredients_detected: string[], recipes: { title, time_minutes, steps }[] }.
 function renderResults(data) {
     const ingredientsList = document.getElementById("ingredients");
     const recipesDiv = document.getElementById("recipes");
@@ -86,6 +94,8 @@ function renderResults(data) {
     });
 }
 
+// Static placeholder response used when the backend rate-limits or is unreachable.
+// Keeps the demo functional without a live OpenAI round-trip.
 function getFallbackRecipes() {
     return {
         ingredients_detected: ["tomate", "alho", "azeite"],

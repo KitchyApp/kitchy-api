@@ -34,6 +34,8 @@ from database import Base
 
 
 class AiRecipeCache(Base):
+    """Persistent cache row mapping a deterministic key to generated recipe JSON."""
+
     __tablename__ = "ai_recipe_cache"
 
     # The full cache key is the primary key — direct equality lookup, O(log n).
@@ -47,6 +49,7 @@ class AiRecipeCache(Base):
     # Serialised JSON list of recipe dicts, exactly as returned by generate_recipes().
     recipe_json: Mapped[str] = mapped_column(Text, nullable=False)
 
+    # Insertion timestamp; useful for manual staleness-based cleanup jobs.
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,

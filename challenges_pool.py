@@ -19,6 +19,7 @@ Rotation contract
 """
 
 # ── Culinary — free ───────────────────────────────────────────────────────────
+# Rotated weekly: exactly 1 entry from this list is active per week (see scheduler).
 
 FREE_CULINARY_CHALLENGES: list[dict] = [
     {
@@ -59,6 +60,7 @@ FREE_CULINARY_CHALLENGES: list[dict] = [
 ]
 
 # ── Culinary — premium ────────────────────────────────────────────────────────
+# Rotated weekly: exactly 2 entries from this list are active per week.
 
 PREMIUM_CULINARY_CHALLENGES: list[dict] = [
     {
@@ -99,6 +101,7 @@ PREMIUM_CULINARY_CHALLENGES: list[dict] = [
 ]
 
 # ── Barman — free ─────────────────────────────────────────────────────────────
+# Rotated weekly: exactly 1 entry from this list is active per week.
 
 FREE_BARMAN_CHALLENGES: list[dict] = [
     {
@@ -125,6 +128,7 @@ FREE_BARMAN_CHALLENGES: list[dict] = [
 ]
 
 # ── Barman — premium ──────────────────────────────────────────────────────────
+# Rotated weekly: exactly 1 entry from this list is active per week.
 
 PREMIUM_BARMAN_CHALLENGES: list[dict] = [
     {
@@ -155,6 +159,7 @@ PREMIUM_BARMAN_CHALLENGES: list[dict] = [
 FREE_CHALLENGES: list[dict] = FREE_CULINARY_CHALLENGES
 PREMIUM_CHALLENGES: list[dict] = PREMIUM_CULINARY_CHALLENGES
 
+# Flat union of all challenge dicts — used for seeding DB rows and bulk lookups.
 CHALLENGE_POOL: list[dict] = (
     FREE_CULINARY_CHALLENGES
     + PREMIUM_CULINARY_CHALLENGES

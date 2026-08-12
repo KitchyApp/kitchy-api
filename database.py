@@ -1,3 +1,9 @@
+"""
+Database bootstrap for the Smart Kitchen backend.
+
+Provides the SQLAlchemy engine, session factory, declarative Base, a lightweight
+append-only column migration helper, and the FastAPI get_db dependency.
+"""
 import logging
 import os
 

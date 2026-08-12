@@ -27,6 +27,7 @@ from jose import jwt, JWTError
 _secret = os.getenv("JWT_SECRET")
 
 if not _secret:
+    # Fallback for local development only — never use in production.
     _secret = "dev-only-insecure-secret-CHANGE-IN-PRODUCTION"
     warnings.warn(
         "\n⚠️  AVISO DE SEGURANÇA: JWT_SECRET não está definido nas variáveis de ambiente.\n"

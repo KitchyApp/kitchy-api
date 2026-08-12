@@ -28,6 +28,8 @@ from database import Base
 
 
 class AnalyticsEvent(Base):
+    """Single behavioural event row for lightweight product analytics."""
+
     __tablename__ = "analytics_events"
 
     id: Mapped[int] = mapped_column(
@@ -59,6 +61,7 @@ class AnalyticsEvent(Base):
         nullable=True,
     )
 
+    # UTC timestamp when the event was recorded.
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,

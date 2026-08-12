@@ -1,35 +1,23 @@
+"""Pydantic request/response schemas for authentication endpoints."""
+
 from pydantic import BaseModel, EmailStr, constr
 
 
-# ========================
-# AUTH SCHEMAS
-# ========================
-
 class LoginSchema(BaseModel):
-    """
-        Schema used for user login requests.
+    """Request body for POST /auth/login."""
 
-        Fields:
-            email: User's email address
-            password: User's plain-text password (will be validated against hashed version in backend)
-
-        Notes:
-        - This schema ensures request body validation via Pydantic
-        - Automatically enforces required fields
-        - Can be extended later with stricter validation (e.g., EmailStr, min length)
-    """
-
-    # EMAIL VALIDATION
-    email: EmailStr  # ensures valid email format
-
-    # PASSWORD VALIDATION
-    password: constr(min_length=8)  # minimum 8 characters
+    email: EmailStr  # Validated email address.
+    password: constr(min_length=8)  # Plain-text password; min 8 characters.
 
 
 class RegisterSchema(BaseModel):
-    email: EmailStr
-    password: constr(min_length=8)
+    """Request body for POST /auth/register."""
+
+    email: EmailStr  # Unique email used as the login identifier.
+    password: constr(min_length=8)  # Plain-text password; hashed before storage.
 
 
 class RefreshSchema(BaseModel):
-    refresh_token: str
+    """Request body for POST /auth/refresh."""
+
+    refresh_token: str  # Opaque refresh token issued at login.

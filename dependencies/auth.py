@@ -22,6 +22,7 @@ from core.security import decode_access_token
 # TOKEN EXTRACTION SCHEME
 # ========================
 
+# OAuth2 Bearer scheme — tokenUrl points at the login endpoint for OpenAPI docs.
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 

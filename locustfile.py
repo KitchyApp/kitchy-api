@@ -95,6 +95,7 @@ _worker_counter = 0
 
 
 def _next_worker_id() -> int:
+    """Return a monotonically increasing worker ID for unique test-account emails."""
     global _worker_counter
     with _worker_counter_lock:
         _worker_counter += 1
@@ -106,6 +107,7 @@ def _next_worker_id() -> int:
 # =============================================================================
 
 def _auth_header(token: str) -> dict:
+    """Build the Bearer Authorization header expected by protected endpoints."""
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -281,6 +283,12 @@ class KitchyUser(HttpUser):
     # ── Internal ───────────────────────────────────────────────────────────────
 
     def _generate(self, ingredients: str, name: str) -> None:
+        """
+        POST /generate-recipes/ with the given ingredient string.
+
+        Re-authenticates on 401. Treats 403 (quota) and 429 (rate limit) as
+        expected outcomes so they do not inflate the Locust failure rate.
+        """
         if not self.token:
             self.token = _login(self.client, self.email, _PASSWORD)
             if not self.token:
@@ -448,6 +456,7 @@ class QuotaRaceUser(HttpUser):
 
 @events.test_start.add_listener
 def on_test_start(environment, **kwargs) -> None:
+    """Print a scenario summary banner when the Locust test run begins."""
     print(
         "\n"
         "════════════════════════════════════════════════\n"

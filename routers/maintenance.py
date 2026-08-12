@@ -145,30 +145,29 @@ def cleanup_old_records(
     admin: User = Depends(require_admin),
 ):
     """
-    Purga registos temporários e órfãos da base de dados, preservando
-    **sempre** as receitas que os utilizadores guardaram explicitamente
-    como favoritas.
+    Purge stale temporary and orphaned database records while always
+    preserving recipes that users explicitly saved as favourites.
 
-    Tabelas limpas
+    Tables cleaned
     --------------
-    **recipe_cache** — entradas de cache do DB (fallback ao Redis) criadas
-      há mais de `days` dias. Antes de apagar cada entrada, o JSON da coluna
-      `response_json` é parsed e os títulos das receitas são comparados com
-      a tabela `favorites`. Qualquer entrada cujo payload contenha uma receita
-      favorita é **protegida** e contada em `recipe_cache_protected`.
+    **recipe_cache** — DB cache entries (Redis fallback) older than `days`.
+      Before deleting each row, `response_json` is parsed and recipe titles
+      are compared against the `favorites` table. Any cache entry whose
+      payload contains a favourited recipe is **protected** and counted in
+      `recipe_cache_protected`.
 
-    **password_reset_tokens** — tokens cuja `expires_at` já passou.
-      Nunca há risco de apagar um token válido.
+    **password_reset_tokens** — tokens whose `expires_at` has passed.
+      Valid tokens are never deleted.
 
-    **usage_logs** — registos de custo/tokens com mais de 30 dias.
-      Dados de faturação e analytics são preservados em tabelas separadas.
+    **usage_logs** — API cost/token tracking rows older than 30 days.
+      Billing and analytics data live in separate tables and are untouched.
 
-    Parâmetros
+    Parameters
     ----------
-    days      Janela de retenção para recipe_cache (mín 1, máx 365).
-    dry_run   Se true, devolve os contadores sem executar nenhum DELETE.
+    days      Retention window for recipe_cache (min 1, max 365).
+    dry_run   When true, returns counts without executing any DELETE.
 
-    Resposta
+    Response
     --------
     ```json
     {

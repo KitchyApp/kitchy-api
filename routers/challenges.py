@@ -152,6 +152,7 @@ _INGREDIENT_I18N: dict[str, dict[str, str]] = {
 
 
 def _resolve_lang(request: Request, language: Optional[str] = None) -> str:
+    """Resolve display language from query param or Accept-Language header (pt/en/es)."""
     raw = (language or "").strip()
     if not raw:
         raw = request.headers.get("accept-language") or request.headers.get("Accept-Language") or ""
@@ -163,6 +164,7 @@ def _resolve_lang(request: Request, language: Optional[str] = None) -> str:
 
 
 def _translate_title(badge_code: str, fallback: str, lang: str) -> str:
+    """Return the localised challenge title for badge_code, or fallback if unmapped."""
     entry = _TITLE_I18N.get(badge_code)
     if not entry:
         return fallback
@@ -170,6 +172,7 @@ def _translate_title(badge_code: str, fallback: str, lang: str) -> str:
 
 
 def _translate_ingredients(required_csv: str, lang: str) -> str:
+    """Localise a comma-separated ingredient slug list for API display."""
     parts = []
     for token in required_csv.split(","):
         key = token.strip().lower()

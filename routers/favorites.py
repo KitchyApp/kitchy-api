@@ -1,3 +1,15 @@
+"""
+Favorites Router
+
+CRUD endpoints for saving, listing, and deleting user recipes:
+- POST   /favorites           — persist a generated recipe as a favourite
+- GET    /favorites           — list all favourites for the authenticated user
+- DELETE /favorites/{id}      — remove a favourite owned by the current user
+
+All routes require a valid JWT (get_current_user). Business logic is delegated
+to services/favorite_service.py.
+"""
+
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException

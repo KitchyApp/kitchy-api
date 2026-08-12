@@ -127,6 +127,7 @@ def _scalar_count(
 
 
 def _period_dict(from_date: Optional[date], to_date: Optional[date]) -> dict:
+    """Build the ISO date range object included in every analytics response."""
     return {
         "from": from_date.isoformat() if from_date else None,
         "to":   to_date.isoformat()   if to_date   else None,
@@ -155,13 +156,13 @@ def get_overview(
     admin: User = Depends(require_admin),
 ):
     """
-    Devolve o número total de eventos registados na tabela `analytics_events`,
-    divididos por tipo (`event_name`), ordenados do mais frequente para o menos.
+    Return total event counts from `analytics_events`, grouped by `event_name`
+    and ordered from most to least frequent.
 
-    Cada entrada do `breakdown` inclui:
-    - `event`  — nome do evento (snake_case)
-    - `count`  — número absoluto de ocorrências
-    - `pct`    — percentagem relativa ao total no período
+    Each entry in `breakdown` includes:
+    - `event`  — event name (snake_case)
+    - `count`  — absolute occurrence count
+    - `pct`    — percentage share of the period total
     """
     q = db.query(
         AnalyticsEvent.event_name,
@@ -217,20 +218,20 @@ def get_conversions(
     _: User = Depends(require_admin),
 ):
     """
-    Calcula a taxa de conversão entre utilizadores bloqueados pelo limite diário
-    (`limit_blocked_403`) e aqueles que fizeram upgrade (`premium_converted`).
+    Compute the conversion rate between users blocked by the daily quota
+    (`limit_blocked_403`) and those who upgraded (`premium_converted`).
 
-    Métricas devolvidas
-    -------------------
-    `blocked_events`    — ocorrências totais de limit_blocked_403
-    `blocked_users`     — utilizadores únicos que foram bloqueados
-    `converted_events`  — ocorrências totais de premium_converted
-    `converted_users`   — utilizadores únicos que converteram
+    Returned metrics
+    ----------------
+    `blocked_events`      — total limit_blocked_403 occurrences
+    `blocked_users`       — distinct users who were blocked
+    `converted_events`    — total premium_converted occurrences
+    `converted_users`     — distinct users who converted
     `conversion_rate_pct` — converted_users / blocked_users × 100
 
-    Nota: usar contagens de utilizadores únicos (distinct user_id) é mais
-    representativo do funil real do que contar eventos brutos, pois um único
-    utilizador pode ser bloqueado múltiplas vezes antes de converter.
+    Note: distinct user counts better represent the real funnel than raw
+    event counts, because a single user may be blocked multiple times
+    before converting.
     """
     blocked_events   = _scalar_count(db, "limit_blocked_403", from_date, to_date, distinct_users=False)
     blocked_users    = _scalar_count(db, "limit_blocked_403", from_date, to_date, distinct_users=True)
@@ -279,25 +280,24 @@ def get_social_shares(
     _: User = Depends(require_admin),
 ):
     """
-    Analisa os metadados JSON dos eventos de partilha (`share_triggered`,
-    `share_clicked`) e devolve um ranking de plataformas e fontes.
+    Parse JSON metadata from share events (`share_triggered`, `share_clicked`)
+    and return ranked breakdowns by platform and source.
 
-    Campos esperados em `metadata_json`
+    Expected fields in `metadata_json`
     ------------------------------------
-    `platform`  — rede social usada (ex: "whatsapp", "instagram", "threads")
-    `source`    — local da app onde foi partilhado (ex: "recipe_detail")
-    `recipe_title` — título da receita partilhada (agregado separadamente)
+    `platform`     — social network used (e.g. "whatsapp", "instagram", "threads")
+    `source`       — in-app location where the share was triggered (e.g. "recipe_detail")
+    `recipe_title` — shared recipe title (aggregated separately)
 
-    Compatibilidade retroativa
-    --------------------------
-    A versão atual da app Flutter não envia `platform` — apenas `source`.
-    O endpoint trata `platform` como opcional e reporta-o quando presente,
-    devolvendo "unknown" caso contrário.
+    Backward compatibility
+    ----------------------
+    The current Flutter app sends `source` but not `platform`. This endpoint
+    treats `platform` as optional and reports "unknown" when absent.
 
-    Adicionar `platform` ao evento no Flutter (em RecipeDetailScreen):
+    To add `platform` in Flutter (RecipeDetailScreen):
         appApi.logEvent('share_triggered', metadata: {
           'source': 'recipe_detail',
-          'platform': platform_name,   // ← adicionar este campo
+          'platform': platform_name,   // ← add this field
           'recipe_title': recipe.title,
         });
     """

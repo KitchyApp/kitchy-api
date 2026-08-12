@@ -28,6 +28,8 @@ from database import Base
 
 
 class ChefChallenge(Base):
+    """A curated cooking challenge that can be rotated in and out weekly."""
+
     __tablename__ = "chef_challenges"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
@@ -82,6 +84,7 @@ class ChefChallenge(Base):
     # ISO year matching week_number — required to handle week-1 of a new year.
     week_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # Timestamp when this challenge row was first inserted.
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
@@ -90,10 +93,13 @@ class ChefChallenge(Base):
 
 
 class UserChallengeProgress(Base):
+    """Tracks whether a specific user has completed a given chef challenge."""
+
     __tablename__ = "user_challenge_progress"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
 
+    # Owner of this progress record; cascades on user deletion.
     user_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("users.id", ondelete="CASCADE"),
@@ -101,6 +107,7 @@ class UserChallengeProgress(Base):
         index=True,
     )
 
+    # The challenge being tracked; cascades on challenge deletion.
     challenge_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("chef_challenges.id", ondelete="CASCADE"),
@@ -108,6 +115,7 @@ class UserChallengeProgress(Base):
         index=True,
     )
 
+    # True once the user has verified a qualifying recipe for this challenge.
     is_completed: Mapped[bool] = mapped_column(
         Boolean,
         default=False,

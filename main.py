@@ -1,22 +1,28 @@
 """
-Module: main.py
+Smart Kitchen backend — FastAPI application entry point.
 
-Description:
-Core FastAPI application for Smart Kitchen backend.
+This module wires together routing, persistence, AI services, and billing.
+Auth, favourites, challenges, and admin routes live in ``routers/``; this
+file defines the core AI pipeline and several legacy/inline HTTP endpoints.
 
-Responsibilities:
-- User authentication & authorization (JWT)
-- Subscription management (Google Play Billing )
-- Image analysis & ingredient detection (OpenAI Vision)
-- Recipe generation (AI-powered)
-- Rate limiting & caching (Redis)
-- User preferences & usage tracking
+Primary responsibilities
+------------------------
+- **Image analysis** (``POST /analyze-image/``): OpenAI Vision ingredient
+  detection, recipe generation, daily quota enforcement, and dual-layer caching.
+- **Text recipes** (``POST /generate-recipes/``): same generation pipeline
+  without Vision, driven by a comma-separated ingredient string.
+- **Billing** (``POST /verify-purchase``, ``DELETE /billing/cancel``,
+  ``POST /auth/subscribe``): Google Play purchase verification and plan sync.
+- **Preferences & subscription** (``GET/PUT /preferences``, ``GET /subscription-status``).
+- **Weekly chef challenges**: ISO-week rotation on startup and every Monday UTC.
+- **Rate limiting**: SlowAPI + Redis, keyed by client IP.
 
-Architecture Notes:
-- Uses FastAPI + SQLAlchemy ORM
-- Redis for caching and rate limiting
-- OpenAI for AI processing
-- Designed to evolve into SaaS-grade backend
+Architecture
+------------
+- FastAPI + SQLAlchemy ORM (PostgreSQL via ``DATABASE_URL``).
+- Redis: recipe cache (ephemeral) and SlowAPI rate-limit storage.
+- OpenAI: ``gpt-4o-mini`` for Vision; ``gpt-4.1-mini`` for recipe JSON.
+- Idempotent column migrations on startup (``run_column_migrations``).
 """
 
 # ========================
@@ -409,6 +415,7 @@ app.include_router(
 # RATE LIMITING (ANTI-ABUSE)
 # ========================
 
+# SlowAPI stores counters in Redis; falls back to localhost when REDIS_URL is unset.
 limiter = Limiter(
     key_func=get_remote_address,
     storage_uri=redis_url if redis_url else "redis://localhost:6379"
@@ -436,6 +443,8 @@ app.add_exception_handler(
 
 
 class SubscriptionPlan(str, Enum):
+    """Canonical plan identifiers stored on ``User.plan`` and in billing flows."""
+
     FREE = "free"
     MONTHLY = "monthly"
     YEARLY = "yearly"
@@ -447,10 +456,10 @@ class SubscriptionPlan(str, Enum):
 
 class RecipeCache(Base):
     """
-        Database fallback cache for generated recipes.
+    Legacy database cache for generated recipes (superseded by ``AiRecipeCache``).
 
-        Used when Redis is unavailable or for persistence.
-        """
+    Retained for backward compatibility; new writes go through ``_db_cache_write``.
+    """
     __tablename__ = "recipe_cache"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -461,11 +470,10 @@ class RecipeCache(Base):
 
 class PasswordResetToken(Base):
     """
-        Token used for password reset flows.
+    One-time token for the forgot-password / reset-password flow.
 
-        Security:
-        - Short expiration time (15 min recommended)
-        """
+    Tokens expire after 15 minutes and are deleted on successful reset.
+    """
     __tablename__ = "password_reset_tokens"
 
     id = Column(Integer, primary_key=True)
@@ -476,12 +484,10 @@ class PasswordResetToken(Base):
 
 class UsageLog(Base):
     """
-       Tracks API usage (tokens, cost, analytics).
+    Historical API usage record (tokens consumed per call).
 
-       Future:
-       - billing metrics
-       - rate optimization
-       """
+    Reserved for future billing analytics and cost optimisation.
+    """
     __tablename__ = "usage_logs"
 
     id = Column(Integer, primary_key=True)
@@ -501,8 +507,10 @@ Index("idx_purchase_token_hash", Purchase.purchase_token_hash)
 # ========================
 
 class IngredientsRequest(BaseModel):
+    """Body for ``POST /generate-recipes/`` — typed ingredients plus optional exclusions."""
+
     ingredients: str
-    # Titles to avoid when asking for an alternative suggestion (Premium).
+    # Premium: titles already shown; the model must invent a different recipe.
     exclude_titles: List[str] = []
 
 
@@ -516,19 +524,21 @@ class AnalyticsLogRequest(BaseModel):
 
 
 class RegisterRequest(BaseModel):
+    """Registration payload (handled by ``routers.auth`` when mounted)."""
+
     email: EmailStr
     password: constr(min_length=8)
 
 
 class LoginRequest(BaseModel):
+    """Login payload (handled by ``routers.auth`` when mounted)."""
+
     email: EmailStr
     password: str
 
 
 class PurchaseRequest(BaseModel):
-    """
-        Request schema for verifying purchases.
-    """
+    """Body for ``POST /verify-purchase`` — Google Play token and product SKU."""
     purchase_token: str
     product_id: str
 
@@ -566,7 +576,10 @@ def get_db():
 
 def calculate_expiry(product_id: str):
     """
-        Calculates subscription expiration date based on product type.
+    Map a Google Play ``product_id`` to a UTC expiry timestamp.
+
+    ``premium_monthly`` → +30 days; ``premium_yearly`` → +365 days;
+    unknown SKUs fall back to ``now`` (no extension).
     """
     now = datetime.utcnow()
 
@@ -581,10 +594,10 @@ def calculate_expiry(product_id: str):
 
 def check_user_subscription(user: User, db: Session):
     """
-    Validates the most recent purchase and syncs user.plan accordingly.
+    Reconcile ``user.plan`` with the latest non-expired ``Purchase`` row.
 
-    Uses Purchase.expiry_date (the real DB column).
-    Filters for the most recent purchase that has not yet expired.
+    Sets ``plan`` to ``"premium"`` when an active purchase exists; otherwise
+    downgrades to ``"free"`` and clears ``plan_expiry``. Commits the session.
     """
     now = datetime.utcnow()
 
@@ -607,8 +620,14 @@ def check_user_subscription(user: User, db: Session):
     db.commit()
 
 # ========================
-# GOOGLE BILLING (SIMPLIFIED VALIDATION)
+# GOOGLE BILLING (INLINE ENDPOINTS)
 # ========================
+# These routes complement ``routers.billing`` and handle purchase verification,
+# manual cancellation, and a dev-only premium upgrade path.
+#
+# verify_purchase  — validates a Google Play token, stores Purchase, upgrades plan.
+# cancel_billing   — downgrades the JWT user to free (client-side unsubscribe).
+# subscribe        — dev/profile shortcut to activate premium without a receipt.
 
 
 @app.post("/verify-purchase")
@@ -618,17 +637,18 @@ def verify_purchase(
     db: Session = Depends(get_db)
 ):
     """
-        Endpoint to validate and register a purchase.
+    Validate a Google Play purchase token and activate Premium for the caller.
 
-        Notes:
-        - Prevents duplicate purchase_token usage (anti-fraud)
-        - Immediately activates premium access
+    Anti-fraud: rejects duplicate ``purchase_token`` values already stored in
+    ``Purchase``. On success, writes a ``Purchase`` row and sets
+    ``user.plan = "premium"`` with ``plan_expiry`` derived from the SKU.
     """
 
-    # Basic validation
+    # Reject empty tokens before hitting the Google validation helper.
     if not data.purchase_token:
         raise HTTPException(400, "Token inválido")
 
+    # Delegates to Google Play receipt validation (defined elsewhere in the project).
     is_valid = validate_google_purchase(
         data.purchase_token,
         data.product_id
@@ -838,6 +858,11 @@ def resolve_language(request: Request, language: str | None = None) -> str:
 
 
 def _normalize_lang_code(raw: str | None) -> str:
+    """
+    Collapse an Accept-Language tag or locale string to ``pt``, ``en``, or ``es``.
+
+    Unrecognised codes default to ``"pt"`` so prompts and cache keys stay stable.
+    """
     if not raw:
         return "pt"
     # First tag only; drop q-factor (e.g. "pt-PT,pt;q=0.9" → "pt-PT")
@@ -847,6 +872,7 @@ def _normalize_lang_code(raw: str | None) -> str:
 
 
 def _language_full_name(code: str) -> str:
+    """Return the English language name injected into OpenAI system prompts."""
     return {"pt": "Portuguese", "en": "English", "es": "Spanish"}.get(code, "Portuguese")
 
 
@@ -948,6 +974,7 @@ def detect_ingredients(
             f"{dietary_section}"
         )
 
+    # OpenAI Vision call — Chat Completions API with a base64 data-URL image part.
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -1194,6 +1221,8 @@ async def generate_recipes(
     # LAYER 1 — DB CACHE (persistent, survives Redis flush / server restart)
     # =========================================================================
     db_cache_key = (
+        # Deterministic key: sorted ingredients + language + dietary flags +
+        # cuisine, barman mode, and optional exclude-title list.
         ",".join(sorted(i.lower().strip() for i in ingredients))
         + f"|{num_recipes}r"
         + f"|lang={language}"
@@ -1234,10 +1263,9 @@ async def generate_recipes(
         logger.info("[generate_recipes] Redis cache HIT — backfilled DB cache.")
         return cached  # instant response (no API cost)
 
-    # Call OpenAI — system_instructions + prompt already set above (culinary or barman).
-    # Token budget: 1 recipe ≈ 600–800 tokens; 4 recipes ≈ 2 400–3 200 tokens.
-    # We use 2 000 as a safe ceiling for Free (1 recipe) and bump to 4 000 for
-    # Premium (4 recipes) so the JSON is never truncated mid-object.
+    # ── LAYER 3 — OpenAI Responses API (full cache miss) ──────────────────────
+    # ``system_instructions`` carries dietary/barman hard rules; ``prompt`` holds
+    # the task schema. Token ceiling: 2 000 for a single recipe (current default).
     max_tokens = 2000 if num_recipes == 1 else 4000
 
     response = client.responses.create(
@@ -1330,16 +1358,18 @@ async def generate_recipes_from_text(
     accept_language = request.headers.get("accept-language")
     language = accept_language.split(",")[0] if accept_language else "pt-PT"
 
-    # Reset daily counter if it is a new day.
-    # This must happen before the quota check so the first request of a new
-    # day always succeeds regardless of yesterday's analyses_today value.
+    # ── Daily quota reset ─────────────────────────────────────────────────────
+    # Reset ``analyses_today`` when the calendar day changes. Must run *before*
+    # the limit check so the first request of a new day is never blocked by
+    # yesterday's counter.
     hoje = date.today()
     if current_user.last_analysis_date != hoje:
         current_user.analyses_today = 0
         current_user.last_analysis_date = hoje
 
-    # Quota: Premium (is_premium) → 4/day; Free → 1/day.
-    # .strip().lower() avoids false free-tier when plan has odd casing/spaces.
+    # ── Quota enforcement ─────────────────────────────────────────────────────
+    # Free tier: 1 recipe generation per day. Premium: 4 per day.
+    # Each successful call increments ``analyses_today`` below.
     limit = 4 if current_user.is_premium else 1
 
     if int(current_user.analyses_today or 0) >= limit:
@@ -1407,12 +1437,11 @@ async def scan_ingredients(
     user: User = Depends(get_current_user)
 ):
     """
-        Endpoint to scan an image and return detected ingredients + recipes.
+    Legacy image scan endpoint (no daily quota check).
 
-        Flow:
-        1. Read image
-        2. Detect ingredients (AI Vision)
-        3. Generate recipes (AI text model)
+    Reads an uploaded image, runs OpenAI Vision for ingredient detection, then
+    calls ``generate_recipes``. Prefer ``POST /analyze-image/`` for production —
+    it enforces plan limits, validates image size, and supports barman mode.
     """
 
     image_bytes = await file.read()
@@ -1477,18 +1506,18 @@ def subscription_status(
 @app.post("/forgot-password")
 def forgot_password(email: str, db: Session = Depends(get_db)):
     """
-       Initiates password reset flow.
+    Start the password-reset flow for the given email address.
 
-       Security:
-       - Does NOT reveal if email exists (anti-enumeration attack)
-       - Generates temporary token with expiration
+    Security: always returns the same success message to prevent email
+    enumeration. Generates a UUID token valid for 15 minutes when the
+    user exists. Email delivery is stubbed via ``print`` (integrate SES/SendGrid).
     """
 
     user = db.query(User).filter(User.email == email).first()
 
-    # Always return success message
+    # Anti-enumeration: identical response whether or not the email is registered.
     if not user:
-        return {"message": "Se existir conta, email enviado"}  # 🔒 segurança
+        return {"message": "Se existir conta, email enviado"}
 
     # Generate secure random token
     token = str(uuid.uuid4())
@@ -1511,11 +1540,10 @@ def forgot_password(email: str, db: Session = Depends(get_db)):
 @app.post("/reset-password")
 def reset_password(token: str, new_password: str, db: Session = Depends(get_db)):
     """
-        Resets user password using a valid reset token.
+    Complete a password reset using a one-time token.
 
-        Security:
-        - Token must exist and not be expired
-        - Token is deleted after use (one-time use)
+    Rejects expired or unknown tokens. Hashes the new password, deletes the
+    token row (single use), and commits.
     """
 
     reset = db.query(PasswordResetToken).filter(
@@ -1587,14 +1615,7 @@ def update_preferences(
 
 @app.get("/health")
 def health():
-    """
-        Health check endpoint.
-
-        Used for:
-        - Load balancers
-        - Monitoring systems
-        - Uptime checks
-    """
+    """Liveness probe for load balancers and uptime monitors."""
     return {"status": "ok"}
 
 
@@ -1675,7 +1696,7 @@ async def analyze_image(
         current_user.analyses_today = 0
         current_user.last_analysis_date = hoje
 
-    # ── Quota enforcement (UNIVERSAL — Culinária AND Barman) ──────────────────
+    # ── Quota enforcement (UNIVERSAL — culinary AND barman modes) ─────────────
     # Free = 1/day · Premium (current_user.is_premium) = 4/day.
     # Each successful call (including Premium "alternative" / exclude_recipes)
     # increments analyses_today by exactly +1.
@@ -1746,8 +1767,9 @@ async def analyze_image(
     ingredient_names = [n for n in ingredient_names if n]
 
     # Optional exclude_recipes: JSON list of titles already shown to the user.
-    # Falls back to legacy exclude_titles so older clients keep working.
+    # Falls back to legacy exclude_titles so older Flutter builds keep working.
     def _parse_exclude(raw: str) -> list[str]:
+        """Parse a JSON form field into a list of recipe titles to exclude."""
         if not raw or not str(raw).strip():
             return []
         try:
@@ -1790,6 +1812,12 @@ async def analyze_image(
 @app.get("/recipes")
 @limiter.limit("10/minute")
 async def get_recipes(request: Request):
+    """
+    Static sample recipes for integration testing and UI prototyping.
+
+    Returns hard-coded Portuguese recipe cards with a mix of free/premium flags.
+    Not connected to the AI pipeline or database.
+    """
     pass
     return {
         "recipes": [

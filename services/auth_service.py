@@ -172,7 +172,7 @@ def refresh_tokens(db: Session, refresh_token: str):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
-    # 🔥 ROTATION (CRITICAL)
+    # Single-use rotation: invalidate the old refresh token immediately.
     new_refresh = create_refresh_token()
     user.refresh_token_hash = hash_token(new_refresh)
 

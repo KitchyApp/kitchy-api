@@ -1,3 +1,5 @@
+"""Ingredient text normalisation for consistent cache keys and AI prompts."""
+
 # Unicode normalization utilities
 import unicodedata
 
@@ -5,8 +7,8 @@ import unicodedata
 # NORMALIZATION MAP
 # ========================
 
-# Mapping of ingredient variations to a canonical form
-# Used to standardize inputs and improve consistency
+# Mapping of ingredient variations to a canonical form.
+# Used to standardize inputs and improve consistency.
 # Example: "courgette" → "zucchini"
 NORMALIZATION_MAP = {
     "tomatoes": "tomato",
@@ -27,15 +29,10 @@ NORMALIZATION_MAP = {
 
 def normalize_text(text: str) -> str:
     """
-        Normalizes raw text input.
+    Lowercase, trim, and strip accents from a raw ingredient string.
 
-        Steps:
-        - Converts to lowercase
-        - Removes leading/trailing spaces
-        - Applies Unicode normalization (NFKD)
-
-        This ensures consistent comparison across different
-        languages, accents, and input formats.
+    Applies Unicode NFKD normalisation so comparisons are stable across
+    languages, accents, and inconsistent user input.
     """
 
     text = text.lower().strip()
@@ -43,7 +40,7 @@ def normalize_text(text: str) -> str:
     # Normalize unicode characters (e.g., accents)
     text = unicodedata.normalize("NFKD", text)
 
-    # REMOVE ACCENTS
+    # Remove combining marks (accents) left after NFKD decomposition.
     text = "".join(
         char for char in text
         if not unicodedata.combining(char)
@@ -58,15 +55,15 @@ def normalize_text(text: str) -> str:
 
 def normalize_ingredients(ingredients: list[str]) -> list[str]:
     """
-        Normalizes a list of ingredient names.
+    Normalise a list of ingredient names to canonical, deduplicated form.
 
-        Process:
-        1. Normalize each ingredient string
-        2. Map known variations to canonical names
-        3. Remove duplicates
-        4. Return sorted list
+    Process:
+    1. Normalise each ingredient string via normalize_text()
+    2. Map known variations to canonical names via NORMALIZATION_MAP
+    3. Remove duplicates
+    4. Return a sorted list
 
-        Example:
+    Example:
         ["Tomatoes", "cherry tomato"] → ["tomato"]
     """
 

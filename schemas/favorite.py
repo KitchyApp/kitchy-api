@@ -1,3 +1,5 @@
+"""Pydantic schemas for favorite-recipe CRUD endpoints."""
+
 from pydantic import BaseModel
 
 

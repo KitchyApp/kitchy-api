@@ -1,3 +1,5 @@
+"""Pydantic schemas for Google Play billing verification."""
+
 from pydantic import BaseModel, Field
 
 

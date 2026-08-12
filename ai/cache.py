@@ -1,3 +1,5 @@
+"""Redis-backed async cache helpers for AI recipe responses."""
+
 # Hashing utility for cache key generation
 import hashlib
 
@@ -43,16 +45,14 @@ TTL = 60 * 60 * 24  # 24h
 
 def generate_cache_key(ingredients: list[str], language: str):
     """
-        Generates a unique cache key based on ingredients and language.
+    Build a deterministic Redis key from sorted ingredients and locale.
 
-        Steps:
-        - Sort ingredients for consistency
-        - Combine with language
-        - Hash using SHA-256 to produce fixed-length key
+    Steps:
+    - Sort ingredients for consistency
+    - Combine with language
+    - Hash using SHA-256 to produce fixed-length key
 
-        This ensures:
-        - Same inputs → same cache key
-        - Avoids long/unsafe Redis keys
+    Same inputs always produce the same key, keeping Redis keys short and safe.
     """
 
     base = ",".join(sorted(ingredients)) + "_" + language
@@ -65,12 +65,9 @@ def generate_cache_key(ingredients: list[str], language: str):
 
 async def get_cached(key: str):
     """
-       Retrieves cached data from Redis.
+    Fetch a cached value from Redis by key.
 
-       Notes:
-       - Async function (requires 'await' when called)
-       - Returns parsed JSON if found
-       - Returns None if cache miss
+    Returns parsed JSON on a hit, or None on a miss. Must be awaited.
     """
 
     data = await redis_client.get(key)
@@ -87,10 +84,9 @@ async def get_cached(key: str):
 
 async def set_cache(key: str, value: dict):
     """
-        Stores data in Redis cache with expiration (TTL).
+    Store a JSON-serialisable dict in Redis with the module TTL.
 
-        - Serializes value to JSON
-        - Uses SETEX to apply expiration automatically
+    Uses SETEX so entries expire automatically after TTL seconds.
     """
 
     await redis_client.setex(
