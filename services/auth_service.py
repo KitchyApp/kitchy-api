@@ -12,8 +12,6 @@ Why:
 - improves scalability and maintainability
 """
 
-from datetime import datetime
-
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 
@@ -25,6 +23,7 @@ from core.security import (
     hash_password,
     hash_token
 )
+from services.subscription_service import sync_subscription_with_server_time
 
 
 def login_user(db: Session, email: str, password: str):
@@ -106,6 +105,10 @@ def register_user(db: Session, email: str, password: str):
         user = User(
             email=email,
             password=hash_password(password),
+            is_premium=False,
+            subscription_type="free",
+            subscription_expires_at=None,
+            plan="free",
         )
         db.add(user)
         db.commit()
@@ -121,30 +124,13 @@ def register_user(db: Session, email: str, password: str):
 
 def get_user_status(user: User, db: Session) -> dict:
     """
-    Return the real premium status for the authenticated user.
+    Return live Premium status for the authenticated user.
 
-    Logic (uses user.plan + user.plan_expiry stored at purchase time):
-    - plan == "free"     → not premium, no expiry to check
-    - plan == "premium"  → premium only if plan_expiry is None (manual/no-expiry)
-                           or plan_expiry is still in the future
-    - plan == "premium" but plan_expiry is in the past → auto-downgrade to free
-
-    This keeps the query cheap (no extra Purchase table JOIN on every request)
-    while still catching expired subscriptions automatically.
+    Compares subscription_expires_at (and legacy plan_expiry) to the server
+    clock, auto-downgrades expired paid periods in PostgreSQL, then refreshes
+    the Redis subscription cache.
     """
-    if user.plan == "premium" and user.plan_expiry is not None:
-        if user.plan_expiry < datetime.utcnow():
-            user.plan = "free"
-            user.plan_expiry = None
-            db.commit()
-
-    is_premium = user.plan == "premium"
-
-    return {
-        "is_premium": is_premium,
-        "plan": user.plan,
-        "plan_expiry": user.plan_expiry.isoformat() if user.plan_expiry else None,
-    }
+    return sync_subscription_with_server_time(user, db)
 
 
 def refresh_tokens(db: Session, refresh_token: str):

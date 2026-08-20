@@ -104,6 +104,12 @@ from routers import analytics_admin, maintenance
 from services.analytics_service import log_analytics_event
 from schemas.favorite import FavoriteCreate
 from services.favorite_service import add_favorite
+from services.subscription_service import (
+    apply_free_plan,
+    apply_paid_subscription,
+    cache_user_subscription,
+    subscription_type_from_product,
+)
 
 
 # ========================
@@ -678,9 +684,13 @@ def verify_purchase(
 
     # Upgrade user immediately — merge reattaches the JWT user to this session.
     current_user = db.merge(current_user)
-    current_user.plan = "premium"
-    current_user.plan_expiry = expires_at
+    apply_paid_subscription(
+        current_user,
+        subscription_type=subscription_type_from_product(data.product_id),
+        expires_at=expires_at,
+    )
     db.commit()
+    cache_user_subscription(current_user)
 
     return {"status": "success", "message": "Premium activated"}
 
@@ -697,9 +707,9 @@ def cancel_billing(
     and commits. Returns 200 OK.
     """
     current_user = db.merge(current_user)
-    current_user.plan = "free"
-    current_user.plan_expiry = None
+    apply_free_plan(current_user)
     db.commit()
+    cache_user_subscription(current_user)
     return {"status": "cancelled"}
 
 
@@ -714,8 +724,13 @@ def subscribe(
     Relies on the JWT Bearer token to identify the active user.
     """
     current_user = db.merge(current_user)
-    current_user.plan = "premium"
+    apply_paid_subscription(
+        current_user,
+        subscription_type="monthly",
+        expires_at=datetime.utcnow() + timedelta(days=30),
+    )
     db.commit()
+    cache_user_subscription(current_user)
     return {"status": "premium_activated"}
 
 

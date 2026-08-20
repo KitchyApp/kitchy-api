@@ -52,15 +52,38 @@ class User(Base):
     # 3. raw SQL INSERTs (e.g. from tests or scripts) don't need to specify
     #    every column explicitly.
 
-    # Subscription tier: "free" or "premium".
+    # Legacy subscription flag kept in sync with is_premium ("free" | "premium").
+    # Recipe-quota code still reads this column; do not remove.
     plan: Mapped[str] = mapped_column(
         String,
         default="free",
         server_default="free",
     )
 
-    # UTC datetime when the premium plan expires; null for free users.
+    # Legacy UTC expiry kept in sync with subscription_expires_at.
     plan_expiry: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+
+    # Persisted Premium flag. Kept true only while subscription_expires_at is
+    # in the future (or null for a non-expiring grant). Updated by /user/status
+    # and billing webhooks — never inferred only in Python.
+    is_premium: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="0",
+    )
+
+    # Billing SKU family: "free" | "monthly" | "yearly".
+    subscription_type: Mapped[str] = mapped_column(
+        String,
+        default="free",
+        server_default="free",
+    )
+
+    # UTC datetime when the current paid period ends; null for free users.
+    subscription_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime,
         nullable=True,
     )
@@ -121,11 +144,11 @@ class User(Base):
     )
 
     @property
-    def is_premium(self) -> bool:
-        """True when the user has an active Premium plan (not expired)."""
-        plan = (self.plan or "").strip().lower()
-        if plan != "premium":
+    def is_premium_active(self) -> bool:
+        """True when the persisted flag is set and the paid period has not expired."""
+        if not self.is_premium:
             return False
-        if self.plan_expiry is not None and self.plan_expiry < datetime.utcnow():
+        expires = self.subscription_expires_at or self.plan_expiry
+        if expires is not None and expires < datetime.utcnow():
             return False
         return True

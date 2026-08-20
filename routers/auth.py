@@ -95,10 +95,12 @@ def user_status(
     - Auto-downgrades expired premium subscriptions to free before responding.
 
     Response:
-        email                (str)      — user's email address
-        is_premium           (bool)     — true if plan is active premium
-        plan                 (str)      — "free" | "premium"
-        plan_expiry          (str|null) — ISO-8601 datetime or null
+        email                    (str)      — user's email address
+        is_premium               (bool)     — true if paid period is still active
+        subscription_type        (str)      — "free" | "monthly" | "yearly"
+        subscription_expires_at  (str|null) — ISO-8601 datetime or null
+        plan                     (str)      — "free" | "premium" (legacy mirror)
+        plan_expiry              (str|null) — ISO-8601 datetime or null
         dietary_gluten_free  (bool)     — gluten-free restriction active
         dietary_vegetarian   (bool)     — vegetarian restriction active
         dietary_vegan        (bool)     — vegan restriction active

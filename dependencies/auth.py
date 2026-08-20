@@ -9,6 +9,8 @@ Provides a reusable FastAPI dependency that:
 Used across all protected routes (billing, favorites, AI endpoints, etc.)
 """
 
+from datetime import datetime
+
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError
@@ -17,6 +19,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import User
 from core.security import decode_access_token
+from services.subscription_service import apply_free_plan, cache_user_subscription
 
 # ========================
 # TOKEN EXTRACTION SCHEME
@@ -62,5 +65,13 @@ def get_current_user(
     user = db.get(User, user_id)
     if not user:
         raise credentials_exception
+
+    # Drop expired paid periods using the server clock so quota routes see
+    # a consistent is_premium flag without changing their SQL.
+    expires = user.subscription_expires_at or user.plan_expiry
+    if user.is_premium and expires is not None and expires < datetime.utcnow():
+        apply_free_plan(user)
+        db.commit()
+        cache_user_subscription(user)
 
     return user
