@@ -79,7 +79,13 @@ def register_user(db: Session, email: str, password: str):
     Raises HTTP 500 (with a descriptive JSON body) on any database error,
     instead of letting an unhandled exception crash the uvicorn worker and
     produce an opaque traceback.
+
+    On schema-mismatch errors (missing is_premium / subscription_type, etc.),
+    re-runs column migrations once and retries the INSERT so Render recovers
+    without a manual SQL patch.
     """
+    from database import run_column_migrations
+
     # --- check for existing account ---
     try:
         existing = db.query(User).filter(User.email == email).first()
@@ -88,20 +94,25 @@ def register_user(db: Session, email: str, password: str):
         # exist in the physical table). run_column_migrations() in database.py
         # normally fixes this on startup, but we guard here too.
         db.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"Database error while checking for existing user: {exc}. "
-                "The users table schema may be out of date — restart the server "
-                "to trigger the automatic column migration."
-            ),
-        ) from exc
+        try:
+            run_column_migrations()
+            existing = db.query(User).filter(User.email == email).first()
+        except Exception as retry_exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Database error while checking for existing user: {retry_exc}. "
+                    "The users table schema may be out of date — restart the server "
+                    "to trigger the automatic column migration."
+                ),
+            ) from retry_exc
 
     if existing:
         raise HTTPException(status_code=400, detail="Email already exists")
 
-    # --- create new user ---
-    try:
+    # --- create new user (Free plan defaults; columns must exist on Postgres) ---
+    def _create() -> None:
         user = User(
             email=email,
             password=hash_password(password),
@@ -109,17 +120,27 @@ def register_user(db: Session, email: str, password: str):
             subscription_type="free",
             subscription_expires_at=None,
             plan="free",
+            plan_expiry=None,
         )
         db.add(user)
         db.commit()
+
+    try:
+        _create()
     except Exception as exc:
         db.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Database error while creating user: {exc}",
-        ) from exc
+        # Repair missing / wrong-typed subscription columns, then retry once.
+        try:
+            run_column_migrations()
+            _create()
+        except Exception as retry_exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Database error while creating user: {retry_exc}",
+            ) from retry_exc
 
-    return {"message": "User created"}
+    return {"message": "User created", "status": "ok"}
 
 
 def get_user_status(user: User, db: Session) -> dict:

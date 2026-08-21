@@ -82,10 +82,12 @@ def run_column_migrations() -> None:
         - Tables that do not exist yet are skipped — create_all() handles them.
         - For a production-grade migration system, replace this with Alembic.
 
-    Column type strings use generic SQL understood by both SQLite (permissive)
-    and PostgreSQL (strict).
-    Boolean columns use "INTEGER DEFAULT 0" so ADD COLUMN works in SQLite
-    (which stores booleans as integers) and PostgreSQL alike.
+    Column type strings are dialect-aware:
+        - SQLite: BOOLEAN-like fields use INTEGER DEFAULT 0
+        - PostgreSQL: BOOLEAN DEFAULT FALSE (required — INTEGER + Python
+          bool binds cause "column is of type integer but expression is of
+          type boolean" on INSERT, which broke POST /auth/register on Render)
+
     Nullable columns omit DEFAULT so the ADD is valid in strict PostgreSQL;
     non-nullable ones MUST carry a DEFAULT for the ADD to succeed.
 
@@ -93,6 +95,9 @@ def run_column_migrations() -> None:
     it in sync with the corresponding model file.
     """
     inspector = inspect(engine)
+
+    # Dialect-aware boolean DDL for subscription / preference flags.
+    bool_default = "INTEGER DEFAULT 0" if is_sqlite else "BOOLEAN DEFAULT FALSE"
 
     # ── Schema registry ──────────────────────────────────────────────────────
     # { table_name: [(column_name, "SQL_TYPE [DEFAULT value]"), ...] }
@@ -104,17 +109,17 @@ def run_column_migrations() -> None:
             ("refresh_token_hash",  "VARCHAR"),
             ("plan",                "VARCHAR DEFAULT 'free'"),
             ("plan_expiry",         "TIMESTAMP"),
-            ("is_premium",          "INTEGER DEFAULT 0"),
+            ("is_premium",          bool_default),
             ("subscription_type",   "VARCHAR DEFAULT 'free'"),
             ("subscription_expires_at", "TIMESTAMP"),
             ("analyses_today",      "INTEGER DEFAULT 0"),
             ("last_analysis_date",  "DATE"),
-            ("dietary_gluten_free", "INTEGER DEFAULT 0"),
-            ("dietary_vegetarian",  "INTEGER DEFAULT 0"),
-            ("dietary_vegan",       "INTEGER DEFAULT 0"),
+            ("dietary_gluten_free", bool_default),
+            ("dietary_vegetarian",  bool_default),
+            ("dietary_vegan",       bool_default),
             ("preferred_style",     "VARCHAR DEFAULT 'balanced'"),
             ("preferred_cuisine",   "VARCHAR DEFAULT 'international'"),
-            ("marketing_consent",   "INTEGER DEFAULT 0"),
+            ("marketing_consent",   bool_default),
         ],
 
         # ── analytics_events (models/analytics.py) ────────────────────────────
@@ -137,11 +142,11 @@ def run_column_migrations() -> None:
         "chef_challenges": [
             ("title",                "VARCHAR NOT NULL"),
             ("required_ingredients", "VARCHAR NOT NULL"),
-            ("is_premium_only",      "INTEGER DEFAULT 0"),
+            ("is_premium_only",      bool_default),
             ("badge_code",           "VARCHAR DEFAULT '🏅'"),
             ("created_at",           "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
             # Weekly rotation fields — added after initial table creation.
-            ("is_active",            "INTEGER DEFAULT 1"),
+            ("is_active",            "INTEGER DEFAULT 1" if is_sqlite else "BOOLEAN DEFAULT TRUE"),
             ("week_number",          "INTEGER"),
             ("week_year",            "INTEGER"),
             # culinary | barman — drives the Flutter Challenges TabBar.
@@ -152,7 +157,7 @@ def run_column_migrations() -> None:
         "user_challenge_progress": [
             ("user_id",      "INTEGER NOT NULL"),
             ("challenge_id", "INTEGER NOT NULL"),
-            ("is_completed", "INTEGER DEFAULT 0"),
+            ("is_completed", bool_default),
             ("completed_at", "TIMESTAMP"),
         ],
     }
@@ -188,6 +193,72 @@ def run_column_migrations() -> None:
 
     if total_added:
         logger.info("Schema migration complete: %d column(s) added across all tables.", total_added)
+
+    # Repair INTEGER→BOOLEAN mismatch on PostgreSQL for User.is_premium etc.
+    # A previous migration used INTEGER DEFAULT 0; SQLAlchemy Boolean then
+    # fails on INSERT with a type error during /auth/register.
+    if not is_sqlite:
+        _repair_postgres_boolean_columns()
+
+
+def _repair_postgres_boolean_columns() -> None:
+    """
+    Convert legacy INTEGER flag columns on users to BOOLEAN on PostgreSQL.
+
+    Safe / idempotent: only alters columns whose current udt_name is int2/int4/int8.
+    """
+    targets = (
+        ("users", "is_premium"),
+        ("users", "dietary_gluten_free"),
+        ("users", "dietary_vegetarian"),
+        ("users", "dietary_vegan"),
+        ("users", "marketing_consent"),
+    )
+    try:
+        with engine.begin() as conn:
+            for table_name, col_name in targets:
+                row = conn.execute(
+                    text(
+                        """
+                        SELECT udt_name
+                        FROM information_schema.columns
+                        WHERE table_name = :table
+                          AND column_name = :col
+                        """
+                    ),
+                    {"table": table_name, "col": col_name},
+                ).fetchone()
+                if not row:
+                    continue
+                udt = (row[0] or "").lower()
+                if udt not in {"int2", "int4", "int8", "integer", "smallint", "bigint"}:
+                    continue
+                logger.info(
+                    "Schema repair: casting %s.%s from %s to BOOLEAN",
+                    table_name, col_name, udt,
+                )
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {table_name} "
+                        f"ALTER COLUMN {col_name} DROP DEFAULT"
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {table_name} "
+                        f"ALTER COLUMN {col_name} TYPE BOOLEAN "
+                        f"USING (COALESCE({col_name}, 0) <> 0)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {table_name} "
+                        f"ALTER COLUMN {col_name} SET DEFAULT FALSE"
+                    )
+                )
+    except Exception as exc:
+        # Never block startup — register will still try and surface a clear error.
+        logger.warning("PostgreSQL boolean column repair skipped: %s", exc)
 
 
 # ========================

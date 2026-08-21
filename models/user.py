@@ -6,6 +6,7 @@ from sqlalchemy import (
     Boolean,
     Date,
     DateTime,
+    false,
 )
 
 from sqlalchemy.orm import Mapped, mapped_column
@@ -69,10 +70,11 @@ class User(Base):
     # Persisted Premium flag. Kept true only while subscription_expires_at is
     # in the future (or null for a non-expiring grant). Updated by /user/status
     # and billing webhooks — never inferred only in Python.
+    # server_default must be SQL boolean FALSE (not "0") so PostgreSQL accepts INSERTs.
     is_premium: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
-        server_default="0",
+        server_default=false(),
     )
 
     # Billing SKU family: "free" | "monthly" | "yearly".
@@ -105,21 +107,21 @@ class User(Base):
     dietary_gluten_free: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
-        server_default="0",
+        server_default=false(),
     )
 
     # When True, generated recipes must exclude meat and fish.
     dietary_vegetarian: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
-        server_default="0",
+        server_default=false(),
     )
 
     # When True, generated recipes must exclude all animal products.
     dietary_vegan: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
-        server_default="0",
+        server_default=false(),
     )
 
     # Recipe style preference passed to the AI prompt (e.g. "balanced", "quick").
@@ -140,7 +142,7 @@ class User(Base):
     marketing_consent: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
-        server_default="0",
+        server_default=false(),
     )
 
     @property

@@ -158,6 +158,12 @@ Base.metadata.create_all(bind=engine)
 # startup. Replace with Alembic for production-grade migrations.
 run_column_migrations()
 
+# Temporary production repair: guarantee is_premium / subscription_* exist on
+# users even if the generic migration above was skipped or failed on Render.
+from force_migrate import force_migrate_users_subscription_columns
+
+force_migrate_users_subscription_columns()
+
 # Register routers (modular API design)
 app.include_router(auth.router, prefix="/auth", tags=["Auth"])
 

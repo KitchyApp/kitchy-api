@@ -28,12 +28,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-@router.post("/register")
+@router.post("/register", status_code=201)
 def register(data: RegisterSchema, db: Session = Depends(get_db)):
     """
     Register a new user account.
 
-    Returns HTTP 400 if the email is already taken.
+    Returns HTTP 201 on success, HTTP 400 if the email is already taken.
     Returns HTTP 500 with a JSON body on unexpected database errors — never
     crashes the uvicorn worker with an unhandled traceback.
     """
